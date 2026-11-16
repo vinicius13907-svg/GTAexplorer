@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0a0a0a" />
+<title>CorteAI — Editor automático de vídeos verticais</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+/* Blindagem de armazenamento: em file:// e content:// (visualizador do WhatsApp) o navegador pode
+   bloquear localStorage/sessionStorage com erro de segurança. Se isso acontecer, usamos uma versão em
+   memória ANTES do Puter.js carregar, para ele (e o app) não quebrarem. */
+(function () {
+  function works(name) {
+    try { var st = window[name]; var k = '__corteai_probe'; st.setItem(k, '1'); st.removeItem(k); return true; }
+    catch (e) { return false; }
+  }
+  function memoryStorage() {
+    var d = {};
+    return {
+      getItem: function (k) { return Object.prototype.hasOwnProperty.call(d, k) ? d[k] : null; },
+      setItem: function (k, v) { d[k] = String(v); },
+      removeItem: function (k) { delete d[k]; },
+      clear: function () { d = {}; },
+      key: function (i) { return Object.keys(d)[i] || null; },
+      get length() { return Object.keys(d).length; }
+    };
+  }
+  ['localStorage', 'sessionStorage'].forEach(function (name) {
+    if (works(name)) return;
+    try { Object.defineProperty(window, name, { value: memoryStorage(), configurable: true }); } catch (e) {}
+  });
+})();
+</script>
+<script src="https://js.puter.com/v2/"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@600;800;900&display=swap" rel="stylesheet" />
+<script>
+  tailwind.config = { darkMode: 'class' };
+</script>
+<style>
+  html, body { background: #0a0a0a; color: #f5f5f5; font-family: 'Montserrat', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  .card { background: #141414; border: 1px solid rgba(255,255,255,.08); border-radius: 1rem; padding: 1rem; }
+  .field { width: 100%; background: #0f0f0f; border: 1px solid rgba(255,255,255,.12); border-radius: .75rem; padding: .7rem .9rem; font-size: .9rem; color: #fff; outline: none; }
+  .field:focus { border-color: #facc15; box-shadow: 0 0 0 3px rgba(250,204,21,.15); }
+  select.field { appearance: none; background-image: linear-gradient(45deg, transparent 50%, #9a9a9a 50%), linear-gradient(135deg, #9a9a9a 50%, transparent 50%); background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; padding-right: 2rem; }
+  .rhythm-btn.active { border-color: #facc15; background: rgba(250,204,21,.1); }
+  input[type=range] { accent-color: #facc15; }
+  button:disabled, select:disabled { opacity: .4; cursor: not-allowed; }
+  #toast { transition: opacity .25s, transform .25s; }
+</style>
+</head>
+<body class="min-h-screen antialiased">
+
+<!-- Cabeçalho -->
+<header class="sticky top-0 z-30 border-b border-white/10 bg-neutral-950/85 backdrop-blur">
+  <div class="mx-auto flex h-14 max-w-5xl items-center justify-between px-4">
+    <div class="flex items-center gap-2">
+      <div class="grid h-8 w-8 place-items-center rounded-lg bg-yellow-400 text-lg text-black">✂</div>
+      <h1 class="text-lg font-black tracking-tight">Corte<span class="text-yellow-400">AI</span></h1>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="max-w-[76px] text-[10px] font-semibold leading-tight text-neutral-500">IA gratuita via Puter</span>
+      <button id="btnPuter" class="shrink-0 rounded-xl border border-yellow-400/60 px-3 py-2 text-xs font-bold text-yellow-300 hover:bg-yellow-400/10">🔑 Conectar Puter</button>
+    </div>
+  </div>
+</header>
+
+<!-- Aviso de login / navegador sem suporte a pop-up -->
+<div id="authNotice" class="hidden border-b border-amber-400/30 bg-amber-400/10" role="alert">
+  <div class="mx-auto flex max-w-5xl items-start gap-3 px-4 py-3">
+    <p id="authNoticeText" class="flex-1 text-xs leading-relaxed text-amber-200"></p>
+    <button id="authNoticeClose" class="shrink-0 rounded-lg border border-amber-300/30 px-2.5 py-1 text-xs font-semibold text-amber-100 hover:bg-amber-300/10">Entendi</button>
+  </div>
+</div>
+
+<main class="mx-auto grid max-w-5xl gap-6 px-4 py-6 lg:grid-cols-2">
+
+  <!-- Coluna de entrada -->
+  <section class="space-y-4">
+
+    <div class="card">
+      <label for="theme" class="mb-2 block text-sm font-bold">Tema ou comando do vídeo</label>
+      <textarea id="theme" rows="3" class="field" placeholder='Ex: "4 segredos absurdos do mapa do GTA 6"'></textarea>
+    </div>
+
+    <div class="card">
+      <p class="mb-2 text-sm font-bold">Ritmo do vídeo</p>
+      <div class="grid grid-cols-2 gap-3">
+        <button type="button" data-interval="2.5" class="rhythm-btn active rounded-xl border border-white/10 p-3 text-left">
+          <span class="block text-sm font-extrabold">⚡ Dinâmico</span>
+          <span class="block text-xs text-neutral-400">Cortes a cada ~2.5s</span>
+        </button>
+        <button type="button" data-interval="4" class="rhythm-btn rounded-xl border border-white/10 p-3 text-left">
+          <span class="block text-sm font-extrabold">🎙 Narrativo</span>
+          <span class="block text-xs text-neutral-400">Cortes a cada ~4s</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="mb-2 flex items-center justify-between">
+        <p class="text-sm font-bold">Clipes brutos</p>
+        <span id="clipCount" class="text-xs text-neutral-400">0 clipes</span>
+      </div>
+      <label for="fileInput" class="flex cursor-pointer flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed border-white/15 px-4 py-6 text-center hover:border-yellow-400/60 hover:bg-white/[.02]" id="dropzone">
+        <span class="text-2xl">🎬</span>
+        <span class="text-sm font-semibold">Toque para escolher vídeos ou fotos</span>
+        <span class="text-xs text-neutral-400">Você pode selecionar vários de uma vez (ou arrastar para cá)</span>
+      </label>
+      <input id="fileInput" type="file" multiple accept="video/*,image/*" class="hidden" />
+      <div id="clipList" class="mt-3 grid grid-cols-3 gap-3 sm:grid-cols-4"></div>
+      <div id="describeBox" class="mt-3 hidden space-y-2">
+        <p class="text-xs leading-relaxed text-neutral-400">
+          Dica: escreva em cada clipe o que aparece nele (ex.: “mapa visto de cima”). Assim a IA encaixa cada frase no clipe certo.
+        </p>
+        <button id="btnDescribe" class="w-full rounded-xl border border-white/15 px-3 py-2 text-xs font-bold hover:bg-white/5">
+          ✨ Descrever clipes com IA
+        </button>
+      </div>
+    </div>
+
+    <div class="card !p-3">
+      <p class="mb-2 text-sm font-bold">🎵 Música de fundo</p>
+      <div class="space-y-2">
+        <label class="flex cursor-pointer items-start gap-2">
+          <input type="radio" name="musicSrc" value="ambient" checked class="mt-1 h-4 w-4 accent-yellow-400" />
+          <span>
+            <span class="block text-sm font-semibold">Batida Ambiente Integrada</span>
+            <span class="block text-xs text-neutral-400">Criada na hora pelo navegador, sem arquivos e sem internet.</span>
+          </span>
+        </label>
+        <label class="flex cursor-pointer items-start gap-2">
+          <input type="radio" name="musicSrc" value="custom" class="mt-1 h-4 w-4 accent-yellow-400" />
+          <span>
+            <span class="block text-sm font-semibold">Meu próprio MP3</span>
+            <span id="musicFileName" class="block text-xs text-neutral-400">Nenhum arquivo escolhido</span>
+          </span>
+        </label>
+        <div class="pl-6">
+          <label for="musicFile" class="inline-block cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-xs font-semibold hover:bg-white/5">Escolher MP3…</label>
+          <input id="musicFile" type="file" accept="audio/*" class="hidden" />
+        </div>
+      </div>
+      <p class="mt-2 text-[11px] leading-relaxed text-neutral-500">A música abaixa sozinha para 12% quando a narração fala e sobe para 28% nos silêncios.</p>
+    </div>
+
+    <div class="space-y-2">
+      <button id="btnAI" class="w-full rounded-2xl bg-yellow-400 px-4 py-3.5 text-sm font-black text-black shadow-lg shadow-yellow-400/10 active:scale-[.99]">
+        ✨ Criar Vídeo com IA
+      </button>
+      <label class="flex cursor-pointer items-center gap-2 px-1 py-1">
+        <input id="autoMode" type="checkbox" class="h-4 w-4 accent-yellow-400" />
+        <span class="text-sm font-semibold">⚡ Modo Automático (gerar e já baixar vídeo)</span>
+      </label>
+      <button id="btnTest" class="w-full rounded-2xl border border-white/15 px-4 py-3 text-sm font-bold hover:bg-white/5">
+        ▶ Gerar Prévia (Modo Teste)
+      </button>
+    </div>
+
+    <!-- Progresso da criação com IA -->
+    <div id="progressCard" class="card hidden">
+      <div class="mb-2 flex items-center justify-between gap-3">
+        <p id="progressTitle" class="text-sm font-bold">Criando seu vídeo…</p>
+        <span id="progressPct" class="text-xs tabular-nums text-neutral-400">0%</span>
+      </div>
+      <div class="h-2.5 w-full overflow-hidden rounded-full bg-white/10">
+        <div id="progressBar" class="h-full rounded-full bg-yellow-400 transition-all duration-300" style="width:0%"></div>
+      </div>
+      <ul id="progressSteps" class="mt-3 space-y-2 text-sm"></ul>
+      <p id="progressNote" class="mt-3 hidden text-xs leading-relaxed"></p>
+      <button id="btnCancel" class="mt-3 hidden rounded-lg border border-white/15 px-3 py-1.5 text-xs font-semibold hover:bg-white/5">Cancelar</button>
+    </div>
+
+    <div id="scriptBox" class="card hidden">
+      <p id="scriptTitle" class="mb-2 text-sm font-bold">Roteiro</p>
+      <ol id="scriptList" class="list-decimal space-y-1 pl-5 text-sm text-neutral-300"></ol>
+      <div id="postBox" class="mt-3 hidden border-t border-white/10 pt-3">
+        <p class="mb-1 text-xs font-bold text-neutral-300">Legenda do post</p>
+        <p id="postDesc" class="text-sm text-neutral-300"></p>
+        <p id="postTags" class="mt-1 break-words text-sm font-semibold text-yellow-400"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Coluna do player -->
+  <section class="lg:sticky lg:top-20 lg:self-start">
+    <div class="mx-auto w-full max-w-[340px]">
+      <div class="overflow-hidden rounded-3xl border border-white/10 bg-black shadow-2xl shadow-black/60">
+        <canvas id="stage" width="1080" height="1920" class="block h-auto w-full"></canvas>
+      </div>
+
+      <div class="mt-3 flex items-center gap-3">
+        <button id="btnPlay" disabled class="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-white text-black">▶</button>
+        <input id="seek" type="range" min="0" max="1000" value="0" disabled class="w-full" />
+        <span id="timeLabel" class="w-20 shrink-0 text-right text-xs tabular-nums text-neutral-400">0:00 / 0:00</span>
+      </div>
+      <p id="sceneLabel" class="mt-2 text-center text-xs text-neutral-500">Envie seus clipes para começar</p>
+
+      <!-- Exportação -->
+      <div class="mt-4 space-y-3">
+        <div class="flex items-stretch gap-2">
+          <button id="btnExport" disabled class="flex-1 rounded-2xl bg-white px-4 py-3.5 text-sm font-black text-black active:scale-[.99]">
+            ⬇ Exportar Vídeo Pronto
+          </button>
+          <select id="exportQuality" class="field !w-auto !px-3 !py-2 text-xs" aria-label="Qualidade da exportação">
+            <option value="1080">1080p</option>
+            <option value="720">720p (leve)</option>
+          </select>
+        </div>
+
+        <div id="exportBox" class="card hidden !p-3">
+          <div class="mb-2 flex items-center justify-between gap-3">
+            <p id="exportTitle" class="text-sm font-bold">Exportando…</p>
+            <span id="exportPct" class="text-xs tabular-nums text-neutral-400">0%</span>
+          </div>
+          <div class="h-2.5 w-full overflow-hidden rounded-full bg-white/10">
+            <div id="exportBar" class="h-full rounded-full bg-green-400 transition-all duration-150" style="width:0%"></div>
+          </div>
+          <p id="exportNote" class="mt-2 text-xs leading-relaxed text-neutral-300"></p>
+          <div id="exportActions" class="mt-3 flex flex-wrap gap-2"></div>
+          <button id="btnExportCancel" class="mt-3 hidden rounded-lg border border-white/15 px-3 py-1.5 text-xs font-semibold hover:bg-white/5">Cancelar exportação</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Toast -->
+<div id="toast" class="pointer-events-none fixed bottom-6 left-1/2 z-50 max-w-[90vw] -translate-x-1/2 translate-y-4 rounded-full bg-white px-4 py-2 text-center text-xs font-bold text-black opacity-0 shadow-xl"></div>
+
+<!-- Narração (oculta) e hospedagem invisível dos vídeos -->
+<audio id="narration" class="hidden" preload="auto" loop playsinline></audio>
+<div id="videoHost" style="position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0;pointer-events:none;"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+     Constantes e estado
+  ===================================================================== */
+  const W = 1080, H = 1920;
+  const FONT = '"Montserrat","Arial Black",Impact,system-ui,sans-serif';
+  const CAPTION_SIZE = 104;
+  const YELLOW = '#FFE600';
+  const EFFECTS = ['zoom-in', 'zoom-out', 'pan-left', 'pan-right'];
+
+  /* ---------------------------------------------------------------------------
+     TAMANHO DO ROTEIRO — troque só esta linha quando quiser mudar de fase:
+       'curto' = 6 a 8 cenas, ~20–25 s (engajamento inicial, até ~10 mil seguidores)
+       'longo' = 12 a 16 cenas, ~50–60 s (vídeos mais longos, para monetização)
+     retryBelow: se a IA devolver menos cenas que isso, o roteiro é refeito antes de gerar a voz.
+  --------------------------------------------------------------------------- */
+  const SCRIPT_PROFILE = 'curto';
+  const SCRIPT_PROFILES = {
+    curto: { minScenes: 6,  maxScenes: 8,  minWords: 55,  maxWords: 70,  secs: '20 a 25', retryBelow: 5 },
+    longo: { minScenes: 12, maxScenes: 16, minWords: 130, maxWords: 160, secs: '50 a 60', retryBelow: 6 }
+  };
+  const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
+  const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+
+  const $ = (id) => document.getElementById(id);
+  const canvas = $('stage');
+  const ctx = canvas.getContext('2d');
+  const narration = $('narration');
+
+  let clips = [];            // { id, name, url, video, duration, thumb }
+  let interval = 2.5;        // ritmo preferido (s por cena)
+  let timeline = null;       // { mode, words, chunks, scenes, total, audio, title, items }
+  let playing = false;
+  let t = 0;
+  let lastTs = 0;
+  let lastScene = -1;
+  let lastClip = null;       // clipe da cena ativa
+  let prepared = -1;         // índice da cena já pré-posicionada
+  let dirty = true;
+  let audioUrl = null;
+  let busy = false;          // criando com IA
+  let describing = false;    // descrevendo clipes com IA
+  let abortCtrl = null;
+
+  // exportação
+  let exporting = false;
+  let exp = null;            // estado da exportação em andamento
+  let exportCanvas = null, vTrack = null;
+  let exportCtx = null;
+  let audioGraph = null;     // { ac, src, speaker, analyser, dest, duck, endFade, norm, rmsBuf }
+  let lastExport = null;     // { blob, name, url, type }
+  let qcReport = { status: 'missing', technical: null, editorial: null, checkedAt: 0 };
+  let qcRunning = false;
+
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const smooth = (p) => p * p * (3 - 2 * p);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const fmt = (s) => {
+    s = Math.max(0, s);
+    return Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+  };
+
+  /* =====================================================================
+     Toast
+  ===================================================================== */
+  let toastTimer;
+  function toast(msg, ms = 3200) {
+    const el = $('toast');
+    el.textContent = msg;
+    el.style.opacity = '1';
+    el.style.transform = 'translate(-50%, 0)';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      el.style.opacity = '0';
+      el.style.transform = 'translate(-50%, 1rem)';
+    }, ms);
+  }
+
+  /* =====================================================================
+     Controles (habilita/desabilita conforme o estado)
+  ===================================================================== */
+  function refreshControls() {
+    const has = clips.length > 0 && !!timeline;
+    $('btnPlay').disabled = !has || exporting;
+    $('seek').disabled = !has || exporting;
+    $('btnExport').disabled = !has || exporting || busy || qcRunning || (qcReport.status === 'blocked');
+    $('btnAI').disabled = busy || exporting || describing;
+    $('btnDescribe').disabled = busy || exporting || describing;
+    $('btnTest').disabled = busy || exporting;
+    $('exportQuality').disabled = exporting;
+    document.querySelectorAll('input[name="musicSrc"]').forEach((r) => { r.disabled = exporting; });
+    $('musicFile').disabled = exporting;
+  }
+
+  /* =====================================================================
+     Ritmo
+  ===================================================================== */
+  document.querySelectorAll('.rhythm-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (exporting) { toast('Aguarde a exportação terminar 🙂'); return; }
+      document.querySelectorAll('.rhythm-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      interval = parseFloat(btn.dataset.interval);
+      if (timeline && timeline.mode === 'test') {
+        timeline.total = Math.max(timeline.wordsEnd, interval);
+        timeline.scenes = buildFixedScenes(timeline.total);
+      }
+      lastScene = -1;
+      dirty = true;
+    });
+  });
+
+  /* =====================================================================
+     Upload de clipes
+  ===================================================================== */
+  const fileInput = $('fileInput');
+  fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
+
+  const dz = $('dropzone');
+  ['dragover', 'dragenter'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('border-yellow-400/60'); }));
+  ['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('border-yellow-400/60'); }));
+  dz.addEventListener('drop', (e) => { if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
+
+  // ---- Tipos de mídia: cada clipe é um vídeo (<video>) ou uma foto (new Image()).
+  // Em clip.video fica o elemento de mídia, seja qual for o tipo.
+  const IMG_EXT = /\.(jpe?g|png|webp|gif|bmp|avif|heic|heif)$/i;
+  const VID_EXT = /\.(mp4|m4v|mov|webm|mkv|3gp|avi)$/i;
+  const IMAGE_MAX_SIDE = 2400;       // fotos maiores são reduzidas (12 MP+ estouram a memória do celular)
+  const IMAGE_DURATION = 5;
+
+  function fileKind(file) {
+    const ty = (file.type || '').toLowerCase();
+    if (ty.startsWith('video/')) return 'video';
+    if (ty.startsWith('image/')) return 'image';
+    if (IMG_EXT.test(file.name || '')) return 'image';
+    if (VID_EXT.test(file.name || '')) return 'video';
+    return null;
+  }
+
+  const isImage = (c) => !!c && c.type === 'image';
+  const mediaW = (el) => el.videoWidth || el.naturalWidth || 0;
+  const mediaH = (el) => el.videoHeight || el.naturalHeight || 0;
+  function mediaReady(el) {
+    if (!el) return false;
+    if (el instanceof HTMLImageElement) return el.complete && el.naturalWidth > 0;
+    return el.readyState >= 2 && el.v
