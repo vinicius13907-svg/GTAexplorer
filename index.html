@@ -383,4 +383,1667 @@
   function mediaReady(el) {
     if (!el) return false;
     if (el instanceof HTMLImageElement) return el.complete && el.naturalWidth > 0;
-    return el.readyState >= 2 && el.v
+    return el.readyState >= 2 && el.videoWidth > 0;
+  }
+
+  const MAX_CLIPS = 40;
+  const MAX_VIDEO_BYTES = 600 * 1048576;     // vídeos acima disso derrubam a aba no celular
+  const MAX_IMAGE_BYTES = 40 * 1048576;
+  const LOAD_TIMEOUT_MS = 25000;
+
+  // Tira um clipe que não carregou (sem erro silencioso: sempre explica o motivo).
+  function discardClip(clip, why) {
+    const i = clips.indexOf(clip);
+    if (i < 0) return;
+    try { if (clip.video) { clip.video.pause(); clip.video.remove(); } } catch {}
+    try { URL.revokeObjectURL(clip.url); } catch {}
+    clips.splice(i, 1);
+    lastScene = -1; lastClip = null; prepared = -1;
+    if (!clips.length) { setPlaying(false); timeline = null; t = 0; $('scriptBox').classList.add('hidden'); }
+    renderClipList();
+    updateEmptyState();
+    dirty = true;
+    toast(why, 6000);
+  }
+
+  function addFiles(fileList) {
+    if (exporting) { toast('Aguarde a exportação terminar 🙂'); return; }
+    if (busy) { toast('Aguarde o vídeo terminar de ser criado para adicionar arquivos 🙂'); return; }
+    let added = 0, ignored = 0, tooBig = 0, dup = 0, overLimit = 0;
+    Array.from(fileList).forEach((file) => {
+      const kind = fileKind(file);
+      if (!kind) { ignored++; return; }
+      if (clips.length >= MAX_CLIPS) { overLimit++; return; }
+      if (file.size > (kind === 'image' ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES)) { tooBig++; return; }
+      if (file.size === 0) { ignored++; return; }
+      if (clips.some((c) => c.name === file.name && c.size === file.size)) { dup++; return; }
+      const url = URL.createObjectURL(file);
+      const clip = { id: Math.random().toString(36).slice(2), name: file.name, url, type: kind, size: file.size, video: null, media: null, duration: kind === 'image' ? IMAGE_DURATION : 0, thumb: '', desc: '' };
+      clips.push(clip); added++;
+      // Se o arquivo nunca terminar de carregar, tira da lista e avisa (em vez de ficar uma miniatura vazia para sempre).
+      clip.loadTimer = setTimeout(() => {
+        const ready = clip.type === 'image' ? !!clip.thumb : (clip.duration > 0 && clip.thumb);
+        if (!ready) discardClip(clip, '“' + file.name + '” demorou demais para abrir e foi removido. Tente converter para MP4 (H.264) ou use um arquivo menor.');
+      }, LOAD_TIMEOUT_MS);
+      if (kind === 'image') {
+        addImageClip(clip);
+      } else {
+        const v = document.createElement('video');
+        clip.video = clip.media = v;
+        v.muted = true; v.defaultMuted = true; v.loop = true; v.playsInline = true;
+        v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', ''); v.preload = 'auto'; v.src = url;
+        $('videoHost').appendChild(v);
+        v.addEventListener('loadedmetadata', () => {
+          if (!Number.isFinite(v.duration) || v.duration < 0.2) { discardClip(clip, '“' + file.name + '” não tem uma duração válida e foi removido.'); return; }
+          if (!v.videoWidth) { discardClip(clip, '“' + file.name + '” não tem imagem (só áudio?) e foi removido.'); return; }
+          clip.duration = v.duration;
+          try { v.currentTime = Math.min(0.5, v.duration / 2); } catch {}
+          renderClipList();
+        }, { once: true });
+        v.addEventListener('seeked', () => { if (!clip.thumb && v.videoWidth) { clip.thumb = makeThumb(v); clearTimeout(clip.loadTimer); renderClipList(); } dirty = true; });
+        v.addEventListener('loadeddata', () => { dirty = true; });
+        v.addEventListener('error', () => discardClip(clip, 'Não consegui abrir "' + file.name + '" e ele foi removido. Tente outro formato (MP4 costuma ser o mais seguro).'));
+      }
+    });
+    if (added) { lastScene = -1; renderClipList(); updateEmptyState(); dirty = true; }
+    const notes = [];
+    if (ignored) notes.push(ignored + ' arquivo(s) de formato não aceito ou vazio(s)');
+    if (tooBig) notes.push(tooBig + ' grande(s) demais (vídeo até ' + (MAX_VIDEO_BYTES / 1048576) + ' MB, foto até ' + (MAX_IMAGE_BYTES / 1048576) + ' MB)');
+    if (dup) notes.push(dup + ' repetido(s)');
+    if (overLimit) notes.push(overLimit + ' acima do limite de ' + MAX_CLIPS + ' clipes');
+    if (notes.length) toast((added ? added + ' adicionado(s). ' : '') + 'Pulei: ' + notes.join('; ') + '.', 7000);
+    else if (!added && fileList.length) toast('Selecione vídeos ou fotos, por favor 🙂');
+  }
+
+  // Foto: já entra na lista como clipe de 5 s; aqui só carregamos, reduzimos se for gigante e geramos a miniatura.
+  function addImageClip(clip) {
+    const img = new Image();
+    clip.media = img;
+    img.onload = async () => {
+      try { await shrinkImageClip(clip); } catch (err) { console.warn(err); }
+      if (!clips.includes(clip)) return;
+      clip.thumb = makeThumb(clip.media);
+      clearTimeout(clip.loadTimer);
+      renderClipList();
+      updateEmptyState();
+      dirty = true;
+    };
+    img.onerror = () => {
+      const k = clips.indexOf(clip);
+      if (k >= 0) clips.splice(k, 1);
+      try { URL.revokeObjectURL(clip.url); } catch {}
+      lastScene = -1; lastClip = null; prepared = -1;
+      renderClipList();
+      updateEmptyState();
+      toast('Não consegui abrir a foto "' + clip.name + '". Fotos HEIC do iPhone só abrem no Safari: tente JPG ou PNG.', 5000);
+    };
+    img.src = clip.url;
+  }
+
+  // Reduz fotos gigantes antes de usar (guardar 20 fotos de 12 MP decodificadas passa de 1 GB).
+  async function shrinkImageClip(clip) {
+    const img = clip.media;
+    const w = img.naturalWidth, h = img.naturalHeight, m = Math.max(w, h);
+    if (m <= IMAGE_MAX_SIDE) return;
+    const k = IMAGE_MAX_SIDE / m;
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(w * k));
+    c.height = Math.max(1, Math.round(h * k));
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.9));
+    if (!blob) return;
+    const url2 = URL.createObjectURL(blob);
+    const small = new Image();
+    await new Promise((res, rej) => { small.onload = res; small.onerror = rej; small.src = url2; });
+    if (!clips.includes(clip)) { URL.revokeObjectURL(url2); return; }
+    URL.revokeObjectURL(clip.url);
+    clip.url = url2;
+    clip.media = small;
+  }
+
+  function makeThumb(v) {
+    const vw = mediaW(v), vh = mediaH(v);
+    const c = document.createElement('canvas');
+    c.width = 180; c.height = 320;
+    const g = c.getContext('2d');
+    const s = Math.max(c.width / vw, c.height / vh);
+    const dw = vw * s, dh = vh * s;
+    g.drawImage(v, (c.width - dw) / 2, (c.height - dh) / 2, dw, dh);
+    return c.toDataURL('image/jpeg', 0.75);
+  }
+
+  function renderClipList() {
+    const list = $('clipList');
+    // guarda o campo que está sendo digitado, para não perder o foco ao redesenhar
+    const ae = document.activeElement;
+    const focusId = ae && ae.dataset && ae.dataset.descFor;
+    const selStart = focusId && ae.selectionStart;
+    list.textContent = '';
+    clips.forEach((clip, i) => {
+      const item = document.createElement('div');
+      item.className = 'space-y-1.5';
+
+      const box = document.createElement('div');
+      box.className = 'relative overflow-hidden rounded-lg bg-neutral-800';
+      box.style.aspectRatio = '9 / 16';
+      if (clip.thumb) {
+        const img = document.createElement('img');
+        img.src = clip.thumb;
+        img.alt = clip.name;
+        img.className = 'h-full w-full object-cover';
+        box.appendChild(img);
+      } else {
+        const sp = document.createElement('div');
+        sp.className = 'grid h-full w-full place-items-center text-xs text-neutral-500';
+        sp.textContent = '…';
+        box.appendChild(sp);
+      }
+      const num = document.createElement('span');
+      num.className = 'absolute left-1 top-1 rounded bg-black/70 px-1.5 text-[10px] font-bold';
+      num.textContent = i + 1;
+      box.appendChild(num);
+      if (clip.duration) {
+        const d = document.createElement('span');
+        d.className = 'absolute bottom-1 left-1 rounded bg-black/70 px-1.5 text-[10px]';
+        d.textContent = fmt(clip.duration);
+        box.appendChild(d);
+      }
+      const rm = document.createElement('button');
+      rm.className = 'absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/70 text-[10px] hover:bg-red-600';
+      rm.textContent = '✕';
+      rm.setAttribute('aria-label', 'Remover clipe');
+      rm.onclick = () => removeClip(clip.id);
+      box.appendChild(rm);
+      item.appendChild(box);
+
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.maxLength = 120;
+      inp.value = clip.desc || '';
+      inp.placeholder = 'O que aparece?';
+      inp.className = 'field !px-2 !py-1.5 !text-xs';
+      inp.setAttribute('aria-label', 'Descrição do clipe ' + (i + 1));
+      inp.dataset.descFor = clip.id;
+      inp.addEventListener('input', () => { clip.desc = inp.value; });
+      item.appendChild(inp);
+
+      list.appendChild(item);
+      if (focusId === clip.id) {
+        inp.focus();
+        try { inp.setSelectionRange(selStart, selStart); } catch {}
+      }
+    });
+    $('clipCount').textContent = clips.length + (clips.length === 1 ? ' clipe' : ' clipes');
+    $('describeBox').classList.toggle('hidden', clips.length === 0);
+  }
+
+  // Pede à IA (com visão) uma descrição curta de cada clipe sem descrição, usando o quadro em miniatura.
+  async function descreverClipesIA() {
+    if (describing || busy || exporting) return;
+    if (authPending) { toast('Conclua o login na janelinha do Puter primeiro 🙂'); return; }
+    if (!window.puter || !puter.ai) { toast(PUTER_MISSING); return; }
+    const todo = clips.filter((c) => !c.desc.trim() && c.thumb);
+    if (!todo.length) { toast(clips.some((c) => !c.thumb) ? 'Aguarde as miniaturas carregarem 🙂' : 'Todos os clipes já têm descrição ✓'); return; }
+    // login direto no toque (nenhum await antes), só se ainda não estiver conectado
+    const login = puterSignedIn() ? null : requestPuterSignIn();
+    describing = true;
+    refreshControls();
+    if (login) {
+      try { await login; }
+      catch (err) { describing = false; refreshControls(); showAuthProblem(err); return; }
+    }
+    const btn = $('btnDescribe');
+    const old = btn.textContent;
+    let ok = 0, failed = null;
+    try {
+      for (let k = 0; k < todo.length; k++) {
+        btn.textContent = 'Descrevendo ' + (k + 1) + ' de ' + todo.length + '…';
+        const c = todo[k];
+        try {
+          const res = await puter.ai.chat(
+            'Descreva em português, em no máximo 10 palavras, o que aparece nesta imagem de um vídeo. Responda só com a descrição, sem aspas.',
+            c.thumb
+          );
+          const txt = puterText(res).replace(/\s+/g, ' ').replace(/^["“]|["”]$/g, '').trim().slice(0, 120);
+          if (txt && clips.includes(c) && !c.desc.trim()) { c.desc = txt; ok++; }
+        } catch (err) {
+          failed = puterError(err, 'Puter IA');
+          break;
+        }
+      }
+    } finally {
+      describing = false;
+      btn.textContent = old;
+      renderClipList();
+      refreshControls();
+    }
+    if (failed) toast('Não consegui descrever tudo: ' + failed.message + ' Você pode escrever à mão. 🙂', 6000);
+    else toast(ok + (ok === 1 ? ' clipe descrito ✓' : ' clipes descritos ✓'));
+  }
+  $('btnDescribe').onclick = descreverClipesIA;
+
+  function removeClip(id) {
+    if (exporting) { toast('Aguarde a exportação terminar 🙂'); return; }
+    if (busy) { toast('Aguarde o vídeo terminar de ser criado para remover clipes 🙂'); return; }
+    const i = clips.findIndex((c) => c.id === id);
+    if (i < 0) return;
+    const c = clips[i];
+    clearTimeout(c.loadTimer);
+    try { if (c.video) c.video.pause(); } catch {}
+    if (c.video) c.video.remove();
+    URL.revokeObjectURL(c.url);
+    clips.splice(i, 1);
+    lastScene = -1;
+    lastClip = null;
+    prepared = -1;
+    if (!clips.length) {
+      setPlaying(false);
+      timeline = null;
+      t = 0;
+      $('scriptBox').classList.add('hidden');
+    }
+    renderClipList();
+    updateEmptyState();
+    dirty = true;
+  }
+
+  function updateEmptyState() {
+    if (!clips.length) $('sceneLabel').textContent = 'Envie seus clipes para começar';
+    else if (!timeline) $('sceneLabel').textContent = 'Tudo pronto! Toque em “Criar Vídeo com IA”';
+    refreshControls();
+  }
+
+  /* =====================================================================
+     Puter.js — IA de texto e voz gratuitas, sem chaves de API
+  ===================================================================== */
+  const PUTER_TEXT_MODEL = 'gpt-4o-mini';
+  const PUTER_VOICE = { language: 'pt-BR', engine: 'neural' };
+  const PUTER_MISSING = 'Não consegui carregar o Puter.js. Confira a internet e recarregue a página.';
+
+  // O Puter não aceita AbortSignal: ao cancelar, simplesmente paramos de esperar a resposta.
+  function withAbort(promise, signal) {
+    if (!signal) return promise;
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) return reject(new DOMException('Cancelado', 'AbortError'));
+      const onAbort = () => reject(new DOMException('Cancelado', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+        (e) => { signal.removeEventListener('abort', onAbort); reject(e); }
+      );
+    });
+  }
+
+  // Nenhuma chamada fica pendurada para sempre: se a IA/voz não responder no prazo, vira um erro claro.
+  function withTimeout(promise, ms, what) {
+    let timer;
+    const limit = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(what + ' demorou demais para responder (mais de ' + Math.round(ms / 1000) + ' segundos). Confira a internet e tente de novo.')), ms);
+    });
+    return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
+  }
+
+  // ---- Registro de erros: nada falha em silêncio.
+  const errorLog = [];
+  let lastErrToast = 0;
+  function reportError(tag, err, opts) {
+    const msg = (err && (err.message || (err.reason && err.reason.message))) || String(err || 'erro desconhecido');
+    errorLog.push({ at: new Date().toISOString(), tag, msg: String(msg).slice(0, 300) });
+    if (errorLog.length > 40) errorLog.shift();
+    console.error('[CorteAI] ' + tag + ':', err);
+    const quiet = opts && opts.quiet;
+    if (!quiet && Date.now() - lastErrToast > 4000) {
+      lastErrToast = Date.now();
+      toast('Algo inesperado aconteceu (' + tag + '). Seu trabalho continua aqui; se travar, recarregue a página.', 5000);
+    }
+  }
+  window.__corteaiErrors = errorLog;
+  Object.defineProperty(window, '__corteaiTimeline', { get: () => timeline });   // para diagnóstico (console do navegador)
+  window.addEventListener('error', (ev) => {
+    const m = String(ev && ev.message || '');
+    if (/ResizeObserver/i.test(m) || (!ev.error && /^Script error\.?$/i.test(m))) return;   // ruído do navegador/extensões
+    reportError('erro de script', ev.error || m);
+    if (exporting && exp && !exp.failed) { try { exportFail(ev.error || new Error(m)); } catch {} }
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    const r = ev && ev.reason;
+    if (r && r.name === 'AbortError') return;
+    reportError('falha em segundo plano', r || 'promessa rejeitada');
+    if (exporting && exp && !exp.failed) { try { exportFail(r instanceof Error ? r : new Error(String(r))); } catch {} }
+  });
+
+  // Cada modelo devolve a resposta num formato um pouco diferente; aqui viram texto puro.
+  function puterText(res) {
+    if (typeof res === 'string') return res;
+    const c = res && res.message && res.message.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) return c.map((part) => (part && part.text) || '').join('');
+    if (res && typeof res.text === 'string') return res.text;
+    return '';
+  }
+
+  function puterError(err, who) {
+    if (err && err.name === 'AbortError') return err;
+    let msg = '';
+    if (err instanceof Error) msg = err.message;
+    else if (err && typeof err === 'object') {
+      msg = (err.error && (err.error.message || (typeof err.error === 'string' && err.error))) || err.message || err.msg || '';
+      if (!msg) { try { msg = JSON.stringify(err); } catch {} }
+    } else msg = String(err || '');
+    const code = (err && (err.code || (err.error && err.error.code))) || '';
+    const all = msg + ' ' + code;
+    let friendly;
+    if (/auth|sign.?in|log.?in|popup|cancel/i.test(all)) {
+      friendly = window.location.protocol === 'content:'
+        ? WHATSAPP_MSG
+        : 'entre na sua conta Puter (gratuita) quando a janelinha aparecer e permita pop-ups neste site. Depois é só tentar de novo.';
+    } else if (/limit|quota|usage|insufficient|credit|balance/i.test(all)) {
+      friendly = 'o limite gratuito do Puter acabou por agora. Tente de novo mais tarde.';
+    } else if (/failed to fetch|network|offline/i.test(all)) {
+      friendly = 'não consegui conectar ao Puter. Confira a internet.';
+    } else {
+      friendly = msg || 'erro desconhecido.';
+    }
+    return new Error(who + ': ' + friendly);
+  }
+
+  /* ---- Login do Puter (blindado para celular) ---- */
+  const WHATSAPP_MSG = 'O visualizador interno do WhatsApp bloqueia pop-ups, e o login do Puter precisa de um. Abra este app por um link HTTPS no Chrome ou no Safari (por exemplo, hospedando o arquivo no GitHub Pages ou no Netlify) e toque em “Conectar Puter” de novo.';
+  const AUTH_WAIT_MS = 150000;
+  let authPending = false, signedHint = false;
+
+  function puterSignedIn() {
+    if (signedHint) return true;
+    try { return !!(window.puter && puter.auth && puter.auth.isSignedIn()); } catch { return false; }
+  }
+
+  function refreshPuterButton() {
+    const b = $('btnPuter');
+    const on = puterSignedIn() && !authPending;
+    b.textContent = authPending ? '⏳ Conectando…' : (on ? '✓ Puter Conectado' : '🔑 Conectar Puter');
+    b.className = 'shrink-0 rounded-xl border px-3 py-2 text-xs font-bold ' +
+      (on ? 'border-green-400/50 text-green-300 hover:bg-green-400/10' : 'border-yellow-400/60 text-yellow-300 hover:bg-yellow-400/10');
+  }
+
+  // IMPORTANTE: chame sempre direto de um toque, SEM nenhum await antes.
+  // Sem isso o Chrome do celular entende que o pop-up não veio de um clique e o bloqueia.
+  function requestPuterSignIn() {
+    if (!window.puter || !puter.auth) return Promise.reject(new Error(PUTER_MISSING));
+    let p;
+    try { p = puter.auth.signIn(); }
+    catch (err) { return Promise.reject(err); }
+    authPending = true;
+    refreshPuterButton();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Object.assign(new Error('Tempo esgotado esperando o login.'), { code: 'auth_timeout' })), AUTH_WAIT_MS);
+    });
+    const done = () => { clearTimeout(timer); authPending = false; refreshPuterButton(); };
+    return Promise.race([Promise.resolve(p), timeout]).then(
+      (r) => { signedHint = true; done(); return r; },
+      (e) => { done(); throw e; }
+    );
+  }
+
+  function authProblemMessage(err) {
+    if (window.location.protocol === 'content:') return WHATSAPP_MSG;
+    let raw = '';
+    if (err instanceof Error) raw = err.message;
+    else if (err && typeof err === 'object') raw = err.msg || err.message || (err.error && err.error.message) || '';
+    else raw = String(err || '');
+    if (raw === PUTER_MISSING) return PUTER_MISSING;
+    const proto = window.location.protocol === 'file:'
+      ? ' Abrir o arquivo direto do celular (file://) também pode atrapalhar o login: o ideal é usar um link HTTPS.' : '';
+    if (err && err.code === 'auth_timeout') return 'O login demorou demais. Toque em “🔑 Conectar Puter” e conclua o login na janelinha.' + proto;
+    if (/clos|cancel|denied|dismiss/i.test(raw)) return 'O login do Puter foi cancelado. Quando quiser, toque em “🔑 Conectar Puter” e conclua o login na janelinha.' + proto;
+    return 'Não consegui abrir o login do Puter. Permita pop-ups para este site (ícone na barra de endereço) e toque em “🔑 Conectar Puter” de novo. Se estiver abrindo por dentro de um app (WhatsApp, Telegram…), abra o link no Chrome ou no Safari.' + proto + (raw ? ' (' + raw.slice(0, 120) + ')' : '');
+  }
+
+  function showAuthNotice(msg) {
+    $('authNoticeText').textContent = msg;
+    $('authNotice').classList.remove('hidden');
+    try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch {}
+  }
+  function hideAuthNotice() { $('authNotice').classList.add('hidden'); }
+  function showAuthProblem(err) {
+    console.warn(err);
+    showAuthNotice(authProblemMessage(err));
+    toast('Não consegui conectar ao Puter. Leia o aviso no topo 🙂', 5000);
+  }
+
+  $('btnPuter').onclick = () => {
+    if (authPending) return;
+    if (puterSignedIn()) { toast('O Puter já está conectado ✓'); return; }
+    // o signIn() é chamado aqui dentro, na mesma hora do toque
+    requestPuterSignIn().then(() => { hideAuthNotice(); toast('Puter conectado ✓'); }).catch(showAuthProblem);
+  };
+  $('authNoticeClose').onclick = hideAuthNotice;
+
+  /* =====================================================================
+     IA de texto (roteiro em JSON)
+  ===================================================================== */
+  function buildPrompts(tema, n, retryNote) {
+    const P = SCRIPT_PROFILES[SCRIPT_PROFILE];
+    const system =
+      'Você é roteirista de vídeos curtos virais para TikTok em português do Brasil. Responda SOMENTE com JSON válido, sem markdown e sem comentários. ' +
+      'Formato exato: {"titulo":"...","descricao":"...","hashtags":["#...","#...","#...","#...","#..."],"cenas":[{"clipeIndex":0,"texto":"...","motivo":"...","efeito":"zoom-in","destaque":"normal"}]}. ' +
+      '"motivo" é uma frase curta explicando por que aquele clipe combina com a fala daquela cena (cite o que aparece no clipe). ' +
+      'efeito deve ser zoom-in, zoom-out, pan-left ou pan-right. destaque deve ser normal, card-seta ou circulo-foco. ' +
+      '"descricao" é a legenda curta e chamativa do post (até 150 caracteres, com 1 ou 2 emojis e uma pergunta ou chamada para comentar). "hashtags" são exatamente 5 hashtags virais do nicho do vídeo, cada uma começando com # e sem espaços. ' +
+      'Crie obrigatoriamente de ' + P.minScenes + ' a ' + P.maxScenes + ' cenas e de ' + P.minWords + ' a ' + P.maxWords + ' palavras no total (somando o campo "texto" de todas as cenas). ' +
+      'O campo "texto" é a fala narrada E a legenda: escreva do jeito que se fala, com pontuação, sem emojis e sem hashtags. ' +
+      'Alterne frases curtíssimas de impacto (aprox. 1,5–2s) com frases explicativas (aprox. 3–4s), sem enrolação. ' +
+      'Padrão TikTok: a primeira cena é um gancho de até 7 palavras, concreto (número, nome ou lugar) e que abre uma pergunta na cabeça de quem assiste, dito nos primeiros 3 segundos, sem saudação nem apresentação. ' +
+      'Mantenha uma virada de informação a cada 2 a 4 segundos. Use o clipe mais forte e com mais movimento na primeira cena. ' +
+      'A última cena fecha o ciclo retomando o gancho (para o vídeo reiniciar naturalmente) e termina com uma pergunta curta que convide a comentar. ' +
+      'Pelo menos 40% das cenas devem usar card-seta ou circulo-foco. Não invente fatos: diferencie confirmação de rumor.';
+    const user = 'Tema: ' + tema + '\nClipes disponíveis: ' + n + ' (índices de 0 a ' + (n - 1) + ').\n' + clipsContext() +
+      'Duração desejada: ' + P.secs + ' segundos, narração dinâmica mas inteligível. Ajuste o texto para essa janela; a duração real será conferida após gerar a voz.\n' +
+      'Associe cada cena ao clipe que melhor corresponde ao texto. Varie os clipes e não repita o mesmo consecutivamente quando houver alternativas.\n' +
+      (clips.some((c) => c.desc.trim()) ? 'A fala de cada cena deve combinar com a descrição do clipe escolhido; clipes sem descrição servem como cenas de apoio.\n' : '') +
+      'Varie os destaques de forma editorial, sem exagerar; use card-seta para detalhe visual e circulo-foco para ação específica.\n' +
+      'Escreva também a "descricao" do post e as 5 "hashtags" virais do nicho deste tema.' +
+      (retryNote ? '\n' + retryNote : '');
+    return { system, user };
+  }
+
+  // Lista os clipes e o que cada um mostra, para a IA casar cenas e clipes.
+  function clipsContext() {
+    if (!clips.some((c) => c.desc.trim())) return '';
+    return 'Conteúdo de cada clipe:\n' + clips.map((c, i) => '- clipeIndex ' + i + ': ' + (c.desc.trim() || '(sem descrição)')).join('\n') + '\n';
+  }
+
+  function parseJSONLoose(raw) {
+    const txt = String(raw || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+    try { return JSON.parse(txt); } catch {}
+    const a = txt.indexOf('{'), b = txt.lastIndexOf('}');
+    if (a >= 0 && b > a) { try { return JSON.parse(txt.slice(a, b + 1)); } catch {} }
+    throw new Error('A IA não devolveu um JSON válido. Tente novamente.');
+  }
+
+  function cleanHashtags(h) {
+    const arr = Array.isArray(h) ? h : (typeof h === 'string' ? h.split(/[\s,]+/) : []);
+    const out = [];
+    arr.forEach((x) => {
+      let tag = String(x || '').trim().replace(/^#+/, '').replace(/[^\p{L}\p{N}_]/gu, '');
+      if (!tag || tag.length > 30) return;
+      tag = '#' + tag;
+      if (!out.some((o) => o.toLowerCase() === tag.toLowerCase())) out.push(tag);
+    });
+    return out.slice(0, 5);
+  }
+
+  /* =====================================================================
+     QC — Quality Control (checagens locais + revisão editorial via Puter)
+     Não altera a interface: usa o painel de progresso e o toast existentes.
+  ===================================================================== */
+  function qcTechnical(tl) {
+    const errors = [], warnings = [];
+    if (!tl || !Array.isArray(tl.scenes) || !tl.scenes.length) {
+      errors.push('A linha do tempo não contém cenas.');
+      return { ok: false, errors, warnings, score: 0 };
+    }
+    const total = Number(tl.total);
+    if (!Number.isFinite(total) || total <= 0) errors.push('Duração total inválida.');
+    if (Number.isFinite(total) && (total < 8 || total > 60)) warnings.push('Duração fora da faixa recomendada para cortes curtos (8–60 segundos).');
+    if (!Array.isArray(clips) || !clips.length) errors.push('Nenhum clipe foi carregado.');
+    let previousStart = -0.001, previousEnd = 0;
+    tl.scenes.forEach((scene, i) => {
+      const start = Number(scene.start), end = Number(scene.end), idx = Number(scene.clipIndex);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) errors.push('Cena ' + (i + 1) + ' tem duração inválida.');
+      if (start < previousStart) errors.push('A ordem das cenas está inconsistente na cena ' + (i + 1) + '.');
+      if (i && start - previousEnd > 0.15 && Number.isFinite(start)) warnings.push('Possível intervalo sem cena antes da cena ' + (i + 1) + '.');
+      const clipIndex = Number.isInteger(idx) && clips.length ? ((idx % clips.length) + clips.length) % clips.length : -1;
+      if (clipIndex < 0) errors.push('Cena ' + (i + 1) + ' aponta para um clipe inexistente.');
+      else {
+        const clip = clips[clipIndex];
+        if (!clip) errors.push('Clipe da cena ' + (i + 1) + ' não foi encontrado.');
+        else if (clip.type === 'video' && (!clip.video || clip.video.error || !clip.video.videoWidth)) warnings.push('O vídeo do clipe ' + (idx + 1) + ' ainda não confirmou quadros válidos.');
+        else if (clip.type === 'image' && (!clip.media || !clip.media.complete || !clip.media.naturalWidth)) errors.push('A imagem do clipe ' + (idx + 1) + ' não carregou corretamente.');
+      }
+      previousStart = Number.isFinite(start) ? start : previousStart;
+      previousEnd = Number.isFinite(end) ? end : previousEnd;
+    });
+    if (tl.mode === 'ai') {
+      const first = tl.scenes[0];
+      if (first && first.end - first.start > 3.2) warnings.push('O gancho (cena 1) dura ' + (first.end - first.start).toFixed(1).replace('.', ',') + ' s. O TikTok decide nos primeiros ~3 s: o ideal é até 3 s.');
+      if (tl.words && tl.words.length && tl.words[0].start > 0.7) warnings.push('A primeira legenda só aparece em ' + tl.words[0].start.toFixed(1).replace('.', ',') + ' s; o ideal é nos primeiros 0,5 s.');
+      const longIdx = tl.scenes.findIndex((sc, i) => i > 0 && sc.end - sc.start > 6);
+      if (longIdx > 0) warnings.push('A cena ' + (longIdx + 1) + ' dura mais de 6 s; corte a cada 2 a 4 s para segurar a atenção.');
+      (tl.matchNotes || []).slice(0, 3).forEach((m) => warnings.push(m));
+    }
+    if (tl.mode === 'ai' && !tl.audio) warnings.push('Este vídeo foi montado sem narração. Confira se isso foi intencional.');
+    if (tl.words && tl.words.some(w => !Number.isFinite(w.start) || !Number.isFinite(w.end) || w.end <= w.start)) errors.push('Há legendas com tempos inválidos.');
+    if (tl.words && total > 0 && tl.words.some(w => w.start < -0.05 || w.end > total + 0.5)) warnings.push('Há legendas que podem ultrapassar a duração do vídeo.');
+    const score = Math.max(0, 100 - errors.length * 25 - warnings.length * 6);
+    return { ok: errors.length === 0, errors, warnings, score };
+  }
+
+  function qcEditorialPrompt(tl, script) {
+    const scenes = (script && script.cenas ? script.cenas : (tl.items || [])).map((c, i) => ({
+      cena: i + 1,
+      texto: String(c.texto || '').slice(0, 260),
+      clipe: Number.isInteger(c.clipIndex) ? c.clipIndex + 1 : null,
+      descricao_visual: Number.isInteger(c.clipIndex) && clips[c.clipIndex] ? String(clips[c.clipIndex].desc || clips[c.clipIndex].name || '').slice(0, 140) : ''
+    }));
+    return scenes;
+  }
+
+  async function qcEditorial(tl, script, signal) {
+    if (!window.puter || !puter.ai || !Array.isArray(tl.items) || !tl.items.length) {
+      return { available: false, score: null, verdict: 'Revisão editorial indisponível; verificação técnica executada.', issues: [] };
+    }
+    const payload = qcEditorialPrompt(tl, script);
+    const prompt = [
+      'Você é o revisor editorial do GTA Explorer, perfil de vídeos curtos sobre GTA 6.',
+      'Avalie o conteúdo com rigor, sem inventar fatos nem afirmar que consegue prever visualizações.',
+      'Observe: força do gancho inicial, clareza, ritmo, repetição, progressão, CTA, credibilidade e correspondência entre texto e descrição dos clipes.',
+      'Rumores devem ser identificados como rumores; informações não verificáveis devem ser sinalizadas.',
+      'Responda SOMENTE JSON válido neste formato: {"score":0,"verdict":"...","issues":[{"severity":"high|medium|low","scene":1,"category":"hook|clarity|pacing|repetition|visual_match|credibility|cta","problem":"...","suggestion":"..."}]}.',
+      'Score de 0 a 100 é avaliação editorial heurística, não previsão de retenção. No máximo 6 problemas. Se não houver problema, issues deve ser [].',
+      'Cenas e contexto: ' + JSON.stringify({ title: tl.title, duration_seconds: Number(tl.total.toFixed(1)), scenes: payload })
+    ].join('\n');
+    try {
+      const res = await withAbort(withTimeout(puter.ai.chat([
+        { role: 'system', content: 'Responda somente JSON válido. Seja criterioso, específico e econômico.' },
+        { role: 'user', content: prompt }
+      ], { model: PUTER_TEXT_MODEL }), 45000, 'A revisão editorial'), signal);
+      const raw = parseJSONLoose(puterText(res));
+      const score = Math.max(0, Math.min(100, Number(raw.score) || 0));
+      const allowed = new Set(['high', 'medium', 'low']);
+      const issues = (Array.isArray(raw.issues) ? raw.issues : []).slice(0, 6).map(x => ({
+        severity: allowed.has(x.severity) ? x.severity : 'low',
+        scene: Number.isInteger(Number(x.scene)) ? Number(x.scene) : null,
+        category: String(x.category || 'editorial').slice(0, 40),
+        problem: String(x.problem || '').slice(0, 220),
+        suggestion: String(x.suggestion || '').slice(0, 220)
+      })).filter(x => x.problem);
+      return { available: true, score, verdict: String(raw.verdict || 'Revisão concluída.').slice(0, 240), issues };
+    } catch (err) {
+      if (err && err.name === 'AbortError') throw err;
+      console.warn('QC editorial indisponível:', err);
+      return { available: false, score: null, verdict: 'A revisão editorial da IA não foi concluída; a verificação técnica continua válida.', issues: [] };
+    }
+  }
+
+  function qcSummary(report) {
+    const tech = report.technical;
+    const ed = report.editorial;
+    const lines = ['QC técnico: ' + (tech.ok ? 'APROVADO' : 'REPROVADO') + ' • nota ' + tech.score + '/100'];
+    if (tech.errors.length) lines.push('Erros: ' + tech.errors.join(' | '));
+    if (tech.warnings.length) lines.push('Alertas: ' + tech.warnings.join(' | '));
+    if (ed && ed.available) {
+      lines.push('QC editorial: ' + ed.score + '/100 — ' + ed.verdict);
+      ed.issues.slice(0, 4).forEach(x => lines.push('Cena ' + (x.scene || '?') + ' (' + x.severity + '): ' + x.problem + (x.suggestion ? ' Sugestão: ' + x.suggestion : '')));
+    } else if (ed) lines.push(ed.verdict);
+    return lines.join('\n');
+  }
+
+  async function runQC(tl, script, signal, includeEditorial) {
+    qcRunning = true;
+    qcReport = { status: 'running', technical: null, editorial: null, checkedAt: 0 };
+    refreshControls();
+    try {
+      const technical = qcTechnical(tl);
+      const editorial = includeEditorial ? await qcEditorial(tl, script, signal) : null;
+      qcReport = { status: technical.ok ? 'passed' : 'blocked', technical, editorial, checkedAt: Date.now() };
+      const msg = qcSummary(qcReport);
+      progressNote(msg, technical.ok ? (technical.warnings.length || (editorial && editorial.issues.length) ? 'warn' : 'info') : 'error');
+      return qcReport;
+    } finally {
+      qcRunning = false;
+      refreshControls();
+    }
+  }
+
+  function validateExportBlob(blob, mime) {
+    if (!blob || !blob.size) throw new Error('QC da exportação: o arquivo ficou vazio.');
+    if (blob.size < 12000) throw new Error('QC da exportação: o arquivo ficou pequeno demais para um vídeo válido. Tente novamente.');
+    if (!/^video\//i.test(String(mime || blob.type || ''))) throw new Error('QC da exportação: o formato gerado não foi reconhecido como vídeo.');
+    return true;
+  }
+
+  function sanitizeScript(obj, n) {
+    const titulo = String(obj && obj.titulo || '').trim() || 'Seu vídeo';
+    const src = Array.isArray(obj && obj.cenas) ? obj.cenas : [];
+    const cenas = [];
+    let prev = -1;
+    src.forEach((c) => {
+      let texto = String(c && c.texto || '').replace(/\s+/g, ' ').trim();
+      if (!texto || !/[\p{L}\p{N}]/u.test(texto)) return;
+      if (!/[.!?…,;:]$/.test(texto)) texto += '.';
+      let idx = parseInt(c.clipeIndex, 10);
+      if (!Number.isFinite(idx) || idx < 0) idx = cenas.length;
+      idx = idx % n;
+      if (n > 1 && idx === prev) idx = (idx + 1) % n;
+      prev = idx;
+      const destaques = ['normal', 'card-seta', 'circulo-foco'];
+      cenas.push({ clipIndex: idx, texto, motivo: String(c.motivo || '').replace(/\s+/g, ' ').trim().slice(0, 160), efeito: EFFECTS.includes(c.efeito) ? c.efeito : 'zoom-in', destaque: destaques.includes(c.destaque) ? c.destaque : (cenas.length % 3 === 1 ? 'card-seta' : (cenas.length % 3 === 2 ? 'circulo-foco' : 'normal')) });
+    });
+    if (!cenas.length) throw new Error('A IA devolveu um roteiro vazio. Tente novamente.');
+    const minDestaques = Math.ceil(cenas.length * 0.4);
+    let destacados = cenas.filter(c => c.destaque !== 'normal').length;
+    for (let i = 0; destacados < minDestaques && i < cenas.length; i++) {
+      if (cenas[i].destaque === 'normal') { cenas[i].destaque = (destacados % 2 === 0) ? 'card-seta' : 'circulo-foco'; destacados++; }
+    }
+    const descricao = String(obj && obj.descricao || '').replace(/\s+/g, ' ').trim().slice(0, 300) || titulo;
+    let hashtags = cleanHashtags(obj && obj.hashtags);
+    if (!hashtags.length) hashtags = ['#viral', '#fyp', '#reels', '#shorts', '#tiktok'];
+    return { titulo, descricao, hashtags, cenas };
+  }
+
+  /* ---------------------------------------------------------------------------
+     Conferência das cenas: a IA escolhe o clipe de cada fala, e aqui checamos se a escolha faz sentido
+     (palavras da fala x descrição do clipe), evitando repetição e clipe esquecido.
+  --------------------------------------------------------------------------- */
+  const STOP = new Set('para como mais mesmo isso essa esse esta este está são foi vai você voce também tambem quando onde porque pois ainda sobre entre depois antes até ate cada muito muita muitos nossa nosso seus suas seu sua dele dela deles delas aqui ali lá uma umas uns que com sem por nos nas dos das num numa pelo pela só so já ja ter tem têm fazer faz então entao tudo todo toda todos todas nada algo isso aquele aquela'.split(' '));
+  function stemsOf(text) {
+    const out = new Set();
+    String(text || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').split(/[^a-z0-9]+/).forEach((w) => {
+      if (w.length < 4 || STOP.has(w)) return;
+      out.add(w.slice(0, 5));
+    });
+    return out;
+  }
+  function overlap(a, b) { let n = 0; a.forEach((x) => { if (b.has(x)) n++; }); return n; }
+
+  function rematchClips(script) {
+    const notes = [];
+    script.matchNotes = notes;
+    script.matchSwapped = 0;
+    const n = clips.length;
+    if (n < 1 || !script.cenas.length) return;
+    const hasDesc = clips.map((c) => String(c.desc || '').trim().length >= 4);
+    if (!hasDesc.some(Boolean)) {
+      notes.push('Nenhum clipe tem descrição, então as cenas foram escolhidas só pela ordem. Use “✨ Descrever clipes com IA” para a IA combinar melhor imagem e fala.');
+      return;
+    }
+    if (n < 2) return;
+    const clipStems = clips.map((c) => stemsOf(c.desc));
+    const cap = Math.ceil(script.cenas.length / n) + 1;       // nenhum clipe domina o vídeo
+    const uses = new Array(n).fill(0);
+    let prev = -1;
+    script.cenas.forEach((cena, i) => {
+      const st = stemsOf(cena.texto);
+      const score = clipStems.map((cs) => overlap(st, cs));
+      const cur = ((cena.clipIndex % n) + n) % n;
+      const order = [...Array(n).keys()].sort((a, b) => (score[b] - score[a]) || (uses[a] - uses[b]) || ((b === cur) - (a === cur)));
+      const ok = (k) => k !== prev && uses[k] < cap;
+      const best = order.find(ok);
+      let pick = cur;
+      if (!ok(cur)) pick = best != null ? best : (order.find((k) => k !== prev) ?? cur);
+      else if (best != null && ((score[cur] === 0 && score[best] > 0) || score[best] >= score[cur] + 2)) pick = best;
+      if (pick !== cur) { cena.clipIndex = pick; script.matchSwapped++; }
+      uses[pick]++; prev = pick;
+      cena._score = score[pick];
+    });
+    const weak = script.cenas.map((c, i) => (c._score === 0 && hasDesc[c.clipIndex]) ? i + 1 : 0).filter(Boolean);
+    if (weak.length) notes.push('Cena' + (weak.length > 1 ? 's ' : ' ') + weak.slice(0, 4).join(', ') + ': nenhuma descrição de clipe combina bem com a fala. Vale conferir.');
+    const unused = clips.map((c, k) => (uses[k] === 0 ? k + 1 : 0)).filter(Boolean);
+    if (unused.length && n <= script.cenas.length) notes.push('Clipe' + (unused.length > 1 ? 's ' : ' ') + unused.slice(0, 4).join(', ') + ' não entrou no vídeo.');
+  }
+
+  // Pede o roteiro e confere o tamanho: se vier com menos de 6 cenas (vídeo de poucos segundos),
+  // refaz a chamada sozinho ANTES de gerar a voz.
+  const MAX_TRIES = 3;
+  async function gerarRoteiro(tema, signal) {
+    if (!window.puter || !puter.ai) throw new Error(PUTER_MISSING);
+    let note = '', best = 0;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+      const { system, user } = buildPrompts(tema, clips.length, note);
+      const messages = [{ role: 'system', content: system }, { role: 'user', content: user }];
+      let res;
+      try {
+        try {
+          res = await withAbort(withTimeout(puter.ai.chat(messages, { model: PUTER_TEXT_MODEL }), 90000, 'A IA do roteiro'), signal);
+        } catch (e1) {
+          const m1 = (e1 && (e1.message || (e1.error && e1.error.message))) || '';
+          if (!/model/i.test(String(m1))) throw e1;
+          res = await withAbort(withTimeout(puter.ai.chat(messages), 90000, 'A IA do roteiro'), signal);
+        }
+      } catch (err) {
+        throw puterError(err, 'Puter IA');
+      }
+      let script;
+      try {
+        script = sanitizeScript(parseJSONLoose(puterText(res)), clips.length);
+      } catch (err) {
+        if (attempt === MAX_TRIES) throw err;
+        note = 'ATENÇÃO: sua resposta anterior não era um JSON válido. Responda SOMENTE com o JSON no formato pedido, com ' + SCRIPT_PROFILES[SCRIPT_PROFILE].minScenes + ' a ' + SCRIPT_PROFILES[SCRIPT_PROFILE].maxScenes + ' cenas.';
+        continue;
+      }
+      best = Math.max(best, script.cenas.length);
+      if (script.cenas.length >= SCRIPT_PROFILES[SCRIPT_PROFILE].retryBelow) return script;
+      console.info('Roteiro curto (' + script.cenas.length + ' cenas), refazendo…');
+      const P = SCRIPT_PROFILES[SCRIPT_PROFILE];
+      note = 'ATENÇÃO: sua resposta anterior tinha só ' + script.cenas.length + ' cena(s), curta demais. Refaça agora com ' + P.minScenes + ' a ' + P.maxScenes + ' cenas e ' + P.minWords + ' a ' + P.maxWords + ' palavras no total.';
+    }
+    throw new Error('A IA devolveu um roteiro curto demais (' + best + ' cenas). Tente de novo ou escreva o tema com mais detalhes.');
+  }
+
+  /* =====================================================================
+     IA de voz (Puter.js → MP3)
+  ===================================================================== */
+  async function gerarVoz(text, signal) {
+    if (!window.puter || !puter.ai) throw new Error(PUTER_MISSING);
+    if (text.length > 2900) throw new Error('O roteiro ficou longo demais para a voz gratuita (limite de ~3000 caracteres). Tente criar de novo.');
+    let blob;
+    try {
+      const audio = await withAbort(withTimeout(puter.ai.txt2speech(text, PUTER_VOICE), 120000, 'A voz'), signal);
+      if (!audio || !audio.src) throw new Error('o Puter não devolveu o áudio.');
+      const res = await withAbort(withTimeout(fetch(audio.src), 60000, 'O download da voz'), signal);
+      if (!res.ok) throw new Error('não consegui ler o áudio gerado (erro ' + res.status + ').');
+      blob = await res.blob();
+    } catch (err) {
+      throw puterError(err, 'Puter Voz');
+    }
+    if (!blob || blob.size < 500) throw new Error('A voz do Puter devolveu um áudio vazio.');
+    return new Blob([blob], { type: 'audio/mpeg' });
+  }
+
+  // Decodifica o MP3 para medir a duração real e onde a fala realmente começa e termina.
+  async function analyzeAudio(blob) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    try {
+      const ac = new AC();
+      try {
+        const buf = await ac.decodeAudioData(await blob.arrayBuffer());
+        const ch = buf.getChannelData(0), sr = buf.sampleRate, th = 0.015;
+        let s = 0; while (s < ch.length && Math.abs(ch[s]) < th) s++;
+        let e = ch.length - 1; while (e > s && Math.abs(ch[e]) < th) e--;
+        return {
+          duration: buf.duration,
+          speechStart: Math.max(0, s / sr - 0.04),
+          speechEnd: Math.min(buf.duration, e / sr + 0.06)
+        };
+      } finally { if (ac.close) ac.close().catch(() => {}); }
+    } catch {
+      // plano B: mede pelo elemento <audio>
+      const url = URL.createObjectURL(blob);
+      const dur = await new Promise((resolve) => {
+        const a = new Audio();
+        a.preload = 'metadata';
+        a.onloadedmetadata = () => resolve(a.duration);
+        a.onerror = () => resolve(0);
+        a.src = url;
+        setTimeout(() => resolve(0), 4000);
+      });
+      URL.revokeObjectURL(url);
+      if (!dur || !isFinite(dur)) throw new Error('Não consegui ler a duração do áudio gerado.');
+      return { duration: dur, speechStart: 0.1, speechEnd: Math.max(0.5, dur - 0.1) };
+    }
+  }
+
+  function loadAudioElement(url) {
+    return new Promise((resolve) => {
+      const done = () => resolve();
+      narration.addEventListener('loadedmetadata', done, { once: true });
+      narration.addEventListener('error', done, { once: true });
+      narration.src = url;
+      narration.load();
+      setTimeout(done, 4000);
+    });
+  }
+
+  /* =====================================================================
+     Linhas do tempo (legendas + cenas)
+  ===================================================================== */
+  function makeChunks(words) {
+    const chunks = [];
+    let cur = [];
+    const flush = () => {
+      if (!cur.length) return;
+      chunks.push({ words: cur, start: cur[0].start, end: cur[cur.length - 1].end });
+      cur = [];
+    };
+    words.forEach((w) => {
+      if (cur.length && w.scene !== cur[0].scene) flush();
+      cur.push(w);
+      if (cur.length === 3 || w.brk) flush();
+    });
+    flush();
+    return chunks;
+  }
+
+  function cleanWord(tok) {
+    return tok.replace(/[.,;:…"“”()«»—–]/g, '').toUpperCase();
+  }
+
+  // ---- Modo teste (dados simulados, cortes em intervalo fixo)
+  function gerarRoteiroSimulado(tema) {
+    const base = (tema || '').trim().replace(/[.!?]+$/g, '') || 'Você não vai acreditar nisso';
+    return [
+      'Prepare-se! ' + base + '.',
+      'Número um: ninguém percebeu esse detalhe escondido!',
+      'Número dois: está bem na sua frente o tempo todo.',
+      'Número três: isso muda tudo o que você sabia!',
+      'E o último vai te deixar de queixo caído.',
+      'Segue para ver mais conteúdo assim!'
+    ];
+  }
+
+  function buildFixedScenes(total) {
+    const out = [];
+    const count = Math.ceil(total / interval);
+    const n = Math.max(1, clips.length);
+    for (let k = 0; k < count; k++) {
+      out.push({
+        start: k * interval,
+        end: Math.min(total, (k + 1) * interval),
+        clipIndex: k,
+        effect: 'zoom-in',
+        srcStart: Math.floor(k / n) * interval
+      });
+    }
+    return out;
+  }
+
+  function buildTestTimeline(sentences) {
+    let time = 0.3;
+    const words = [];
+    sentences.forEach((s) => {
+      s.trim().split(/\s+/).filter(Boolean).forEach((tok) => {
+        const clean = cleanWord(tok);
+        if (!clean) return;
+        const d = clamp(0.16 + 0.045 * clean.length, 0.22, 0.6);
+        words.push({ text: clean, start: time, end: time + d, brk: /[.,;:!?]$/.test(tok), scene: 0 });
+        time += d;
+        if (/[,;:]$/.test(tok)) time += 0.12;
+        if (/[.!?]$/.test(tok)) time += 0.3;
+      });
+    });
+    const wordsEnd = time + 0.5;
+    const total = Math.max(wordsEnd, interval);
+    return {
+      mode: 'test', title: 'Prévia de teste', words, chunks: makeChunks(words),
+      wordsEnd, total, scenes: buildFixedScenes(total), audio: null,
+      items: sentences.map((s) => ({ texto: s }))
+    };
+  }
+
+  // ---- Modo IA (cenas do roteiro sincronizadas com o áudio real)
+  function buildAITimeline(script, audioInfo) {
+    const tokens = [];
+    script.cenas.forEach((c, i) => {
+      c.texto.split(/\s+/).filter(Boolean).forEach((tok) => {
+        const clean = cleanWord(tok);
+        if (!clean || !/[\p{L}\p{N}]/u.test(clean)) return;
+        const extra = /[,;:]$/.test(tok) ? 3 : (/[.!?…]$/.test(tok) ? 7 : 0);
+        tokens.push({ clean, raw: tok, scene: i, wLen: clean.length + 2, extra });
+      });
+    });
+    const Wtot = tokens.reduce((a, k) => a + k.wLen + k.extra, 0) || 1;
+
+    let speechStart, Ds, total;
+    if (audioInfo) {
+      speechStart = audioInfo.speechStart;
+      Ds = Math.max(0.5, audioInfo.speechEnd - speechStart);
+      total = audioInfo.duration;
+    } else {                      // sem áudio: estima o tempo de fala
+      speechStart = 0.15;
+      Ds = Wtot * 0.055;
+      total = speechStart + Ds + 0.6;
+    }
+
+    const words = [];
+    let cum = 0;
+    tokens.forEach((k) => {
+      const start = speechStart + (cum / Wtot) * Ds;
+      const end = start + (k.wLen / Wtot) * Ds * 0.92;
+      words.push({ text: k.clean, start, end, brk: /[,;:.!?…]$/.test(k.raw), scene: k.scene });
+      cum += k.wLen + k.extra;
+    });
+
+    // Cada cena começa na primeira palavra da sua frase e vai até a primeira da próxima.
+    const firstWord = {};
+    words.forEach((w) => { if (firstWord[w.scene] === undefined) firstWord[w.scene] = w.start; });
+    const used = {};
+    const scenes = [];
+    let prevStart = 0;
+    script.cenas.forEach((c, i) => {
+      let start = i === 0 ? 0 : (firstWord[i] !== undefined ? firstWord[i] - 0.03 : prevStart + 0.5);
+      start = Math.max(start, prevStart + 0.3);
+      if (start >= total - 0.2 && i > 0) return;
+      scenes.push({ start, end: total, clipIndex: c.clipIndex, effect: c.efeito, destaque: c.destaque || 'normal', srcStart: 0, textIndex: i });
+      prevStart = start;
+    });
+    scenes.forEach((s, i) => {
+      s.end = i < scenes.length - 1 ? scenes[i + 1].start : total;
+      const used0 = used[s.clipIndex] || 0;
+      s.srcStart = used0;
+      used[s.clipIndex] = used0 + (s.end - s.start);
+    });
+
+    return {
+      mode: 'ai', title: script.titulo, words, chunks: makeChunks(words),
+      total, scenes, audio: audioInfo ? { duration: audioInfo.duration } : null,
+      items: script.cenas.map((c) => ({ texto: c.texto, clipIndex: c.clipIndex })),
+      post: { descricao: script.descricao, hashtags: script.hashtags },
+      matchNotes: script.matchNotes || []
+    };
+  }
+
+  function showScript() {
+    if (!timeline) return;
+    $('scriptTitle').textContent = timeline.mode === 'ai' ? '🎬 ' + timeline.title : 'Roteiro da prévia';
+    const ol = $('scriptList');
+    ol.textContent = '';
+    timeline.items.forEach((it) => {
+      const li = document.createElement('li');
+      li.textContent = it.texto;
+      if (it.clipIndex !== undefined) {
+        const tag = document.createElement('span');
+        tag.className = 'ml-2 rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-neutral-400';
+        tag.textContent = 'clipe ' + (it.clipIndex + 1);
+        li.appendChild(tag);
+      }
+      ol.appendChild(li);
+    });
+    const post = timeline.post;
+    if (post) {
+      $('postDesc').textContent = post.descricao;
+      $('postTags').textContent = post.hashtags.join(' ');
+      $('postBox').classList.remove('hidden');
+    } else {
+      $('postBox').classList.add('hidden');
+    }
+    $('scriptBox').classList.remove('hidden');
+  }
+
+  function startTimeline(tl, autoplay = true) {
+    timeline = tl;
+    showScript();
+    t = 0;
+    lastScene = -1;
+    prepared = -1;
+    if (narration) { try { narration.currentTime = 0; } catch {} }
+    updateEmptyState();
+    setPlaying(autoplay);
+    dirty = true;
+    if (window.innerWidth < 1024) canvas.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  /* =====================================================================
+     Barra de progresso (criação com IA)
+  ===================================================================== */
+  const STEPS = [
+    { label: 'Escrevendo roteiro...', from: 0, to: 35 },
+    { label: 'Gerando voz...', from: 35, to: 80 },
+    { label: 'Sincronizando cortes...', from: 80, to: 100 }
+  ];
+  let stepStates = ['pending', 'pending', 'pending'];
+  let stepLabels = STEPS.map((s) => s.label);
+  let progPct = 0, progCap = 0, progTimer = null, currentStep = -1, progTitle = '';
+
+  function renderProgress() {
+    $('progressBar').style.width = progPct.toFixed(1) + '%';
+    $('progressPct').textContent = Math.round(progPct) + '%';
+    $('progressTitle').textContent = progTitle || (currentStep >= 0 ? stepLabels[currentStep] : 'Criando seu vídeo…');
+    const ul = $('progressSteps');
+    ul.textContent = '';
+    STEPS.forEach((_, i) => {
+      const li = document.createElement('li');
+      li.className = 'flex items-center gap-2';
+      const ic = document.createElement('span');
+      ic.className = 'grid h-5 w-5 shrink-0 place-items-center text-xs';
+      const st = stepStates[i];
+      if (st === 'active') {
+        ic.innerHTML = '<span class="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-yellow-400 border-t-transparent"></span>';
+      } else if (st === 'done') { ic.textContent = '✓'; ic.className += ' text-green-400 font-black'; }
+      else if (st === 'warn') { ic.textContent = '⚠'; ic.className += ' text-amber-300'; }
+      else if (st === 'error') { ic.textContent = '✕'; ic.className += ' text-red-400 font-black'; }
+      else { ic.textContent = '○'; ic.className += ' text-neutral-600'; }
+      const tx = document.createElement('span');
+      tx.textContent = stepLabels[i];
+      tx.className = st === 'pending' ? 'text-neutral-500' : (st === 'active' ? 'font-bold text-white' : 'text-neutral-300');
+      li.appendChild(ic);
+      li.appendChild(tx);
+      ul.appendChild(li);
+    });
+  }
+
+  function progressNote(msg, kind) {
+    const el = $('progressNote');
+    if (!msg) { el.classList.add('hidden'); return; }
+    el.className = 'mt-3 text-xs leading-relaxed ' + (kind === 'error' ? 'text-red-300' : (kind === 'warn' ? 'text-amber-300' : 'text-neutral-300'));
+    el.textContent = msg;
+  }
+
+  function progressInit() {
+    clearInterval(progTimer);
+    stepStates = ['pending', 'pending', 'pending'];
+    stepLabels = STEPS.map((s) => s.label);
+    progPct = 0; currentStep = -1; progTitle = '';
+    progressNote('');
+    $('progressCard').classList.remove('hidden');
+    $('btnCancel').classList.remove('hidden');
+    renderProgress();
+  }
+  function stepStart(i) {
+    currentStep = i;
+    stepStates[i] = 'active';
+    progPct = Math.max(progPct, STEPS[i].from);
+    progCap = STEPS[i].to - 2;
+    clearInterval(progTimer);
+    progTimer = setInterval(() => {
+      progPct += (progCap - progPct) * 0.05;
+      renderProgress();
+    }, 250);
+    renderProgress();
+  }
+  function stepEnd(i, state) {
+    clearInterval(progTimer);
+    stepStates[i] = state || 'done';
+    progPct = STEPS[i].to;
+    renderProgress();
+  }
+
+  function setBusy(b) {
+    busy = b;
+    $('btnAI').textContent = b ? '⏳ Criando…' : '✨ Criar Vídeo com IA';
+    refreshControls();
+    if (!b) $('btnCancel').classList.add('hidden');
+  }
+
+  $('btnCancel').onclick = () => { if (abortCtrl) abortCtrl.abort(); };
+
+  /* =====================================================================
+     Orquestração: Criar Vídeo com IA
+  ===================================================================== */
+  async function criarVideoIA() {
+    if (busy || exporting) return;
+    if (authPending) { toast('Conclua o login na janelinha do Puter primeiro 🙂'); return; }
+    if (!clips.length) { toast('Suba pelo menos um clipe primeiro 🙂'); return; }
+    const tema = $('theme').value.trim();
+    if (!tema) { toast('Conte o tema do vídeo para eu escrever o roteiro'); $('theme').focus(); return; }
+
+    if (!window.puter || !puter.ai) { toast('Não consegui carregar o Puter.js. Confira a internet e recarregue a página.'); return; }
+
+    // Desbloqueia o áudio dentro do clique (Safari/iOS exigem isso)
+    try {
+      narration.pause();
+      narration.src = SILENT_WAV;
+      const pr = narration.play();
+      if (pr && pr.then) pr.then(() => narration.pause()).catch(() => {});
+    } catch {}
+    warmAudio();   // cria o grafo de áudio dentro do clique (a música já começa a ser preparada)
+
+    // Login do Puter: o signIn() é chamado AQUI, direto no toque (nenhum await antes), e só então esperamos.
+    // Tudo isso acontece antes da barra de progresso aparecer.
+    if (!puterSignedIn()) {
+      const login = requestPuterSignIn();
+      const btn = $('btnAI');
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '🔑 Aguardando login…';
+      try { await login; hideAuthNotice(); }
+      catch (err) { showAuthProblem(err); return; }
+      finally { btn.textContent = label; refreshControls(); }
+    }
+
+    setPlaying(false);
+    qcReport = { status: 'missing', technical: null, editorial: null, checkedAt: 0 };
+    abortCtrl = new AbortController();
+    const signal = abortCtrl.signal;
+    setBusy(true);
+    progressInit();
+    $('btnCancel').classList.remove('hidden');
+    let runAuto = false;
+
+    try {
+      // 1) Roteiro
+      stepStart(0);
+      const script = await gerarRoteiro(tema, signal);
+      try { rematchClips(script); } catch (err) { reportError('conferência das cenas', err, { quiet: true }); script.matchNotes = []; }
+      stepEnd(0);
+
+      // 2) Voz
+      stepStart(1);
+      let blob = null, audioInfo = null, voiceError = null;
+      const fullText = script.cenas.map((c) => c.texto).join(' ');
+      try {
+        blob = await gerarVoz(fullText, signal);
+        audioInfo = await analyzeAudio(blob);
+      } catch (err) {
+        if (err && err.name === 'AbortError') throw err;
+        voiceError = err; blob = null; audioInfo = null;
+      }
+      if (voiceError) {
+        stepLabels[1] = 'Gerando voz... (não deu certo)';
+        stepEnd(1, 'warn');
+        progressNote('Não consegui gerar a voz: ' + voiceError.message + ' Vou montar a prévia só com legendas e cortes estimados.', 'warn');
+      } else {
+        stepEnd(1);
+      }
+
+      // 3) Sincronização
+      stepStart(2);
+      if (audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl = null; }
+      if (blob) {
+        audioUrl = URL.createObjectURL(blob);
+        await loadAudioElement(audioUrl);
+      } else {
+        narration.removeAttribute('src');
+      }
+      await sleep(450);
+      await prepareMusic();
+      if (signal.aborted) throw new DOMException('Cancelado', 'AbortError');
+      await capturePrints();
+      const tl = buildAITimeline(script, audioInfo);
+      stepEnd(2);
+
+      // QC técnico local + uma revisão editorial pelo mesmo modelo Puter.
+      // Se a IA de revisão falhar, o QC técnico permanece disponível.
+      progTitle = 'Revisando qualidade…';
+      renderProgress();
+      await runQC(tl, script, signal, true);
+
+      progTitle = 'Pronto! 🎉';
+      renderProgress();
+      // Uma única mensagem final (o painel mostra só uma): vídeo montado + ajustes de cena + alertas do QC.
+      const qcHasNotes = !!(qcReport && qcReport.technical && (qcReport.technical.errors.length || qcReport.technical.warnings.length ||
+        (qcReport.editorial && qcReport.editorial.available && qcReport.editorial.issues.length)));
+      if (!voiceError) {
+        let msg = 'Vídeo montado: ' + tl.scenes.length + ' cenas em ' + fmt(tl.total) + ' (' + tl.total.toFixed(1).replace('.', ',') + 's), cortes sincronizados com a narração.';
+        if (script.matchSwapped) msg += ' Ajustei ' + script.matchSwapped + (script.matchSwapped === 1 ? ' cena' : ' cenas') + ' para o clipe combinar melhor com a fala.';
+        if (qcHasNotes) msg += ' • ' + qcSummary(qcReport).replace(/\n/g, ' • ');
+        progressNote(msg, qcHasNotes ? 'warn' : 'info');
+      }
+      runAuto = $('autoMode').checked && !voiceError;
+      if ($('autoMode').checked && voiceError) {
+        progressNote('Não consegui gerar a voz: ' + voiceError.message + ' O modo automático foi pausado (sem narração eu não exporto sozinho). Toque em “Exportar Vídeo Pronto” se quiser assim mesmo.', 'warn');
+      }
+      startTimeline(tl, !runAuto);
+      setTimeout(() => { if (!busy) $('progressCard').classList.add('hidden'); }, voiceError ? 12000 : (qcHasNotes ? 16000 : 7000));
+    } catch (err) {
+      runAuto = false;
+      clearInterval(progTimer);
+      if (err && err.name === 'AbortError') {
+        progTitle = 'Cancelado';
+        progressNote('Tudo bem, cancelei por aqui. Quando quiser, é só tentar de novo. 🙂', 'info');
+        if (currentStep >= 0) stepStates[currentStep] = 'error';
+      } else {
+        console.error(err);
+        progTitle = 'Algo não saiu como esperado';
+        if (currentStep >= 0) stepStates[currentStep] = 'error';
+        progressNote((err && err.message) || 'Erro inesperado.', 'error');
+        toast('Não consegui concluir. Veja os detalhes no painel.');
+      }
+      renderProgress();
+    } finally {
+      abortCtrl = null;
+      setBusy(false);
+    }
+    // Modo Automático: assim que tudo está sincronizado, já grava e baixa o vídeo
+    if (runAuto) exportarVideo();
+  }
+
+  $('btnAI').onclick = criarVideoIA;
+
+  $('btnTest').onclick = async () => {
+    if (busy || exporting) return;
+    if (!clips.length) { toast('Suba pelo menos um clipe para testar 🙂'); return; }
+    $('progressCard').classList.add('hidden');
+    warmAudio();
+    if (audioUrl) { narration.pause(); narration.removeAttribute('src'); }
+    await capturePrints();
+    const testTimeline = buildTestTimeline(gerarRoteiroSimulado($('theme').value));
+    qcReport = { status: 'missing', technical: null, editorial: null, checkedAt: 0 };
+    await runQC(testTimeline, null, null, false);
+    startTimeline(testTimeline);
+  };
+
+  /* =====================================================================
+     Música de fundo — Web Audio (loop sintetizado + MP3 opcional + ducking)
+  ===================================================================== */
+  const MUSIC_LOW = 0.12;           // volume enquanto a narração fala
+  const MUSIC_HIGH = 0.28;          // volume nos momentos sem fala
+  const SPEECH_RMS = 0.012;         // nível a partir do qual consideramos que há fala
+  const AMBIENT_BPM = 96;
+  const AMBIENT_BARS = 8;
+  const CUSTOM_MAX_BYTES = 12 * 1048576;
+  const CUSTOM_MAX_SECONDS = 180;
+  let audioFailed = false;
+  let ambientBuf = null, ambientPromise = null;
+  let customBuf = null, customNorm = 1;
+  let musicSel = 'ambient';
+  let musicNode = null;
+  let duckTarget = MUSIC_HIGH, speakUntil = 0, lastEnd = 1;
+
+  // Um único AudioContext para tudo: narração + música -> alto-falante e -> gravação.
+  //   narração ---------------------------> speaker -> alto-falante
+  //            \-> dest (gravação)  \-> analyser (detecta fala)
+  //   música -> fade -> norm -> duck -> endFade -> speaker / dest
+  function buildAudioGraph() {
+    if (audioGraph) return audioGraph;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) throw new Error('Este navegador não suporta a Web Audio API.');
+    const ac = new AC();
+    const src = ac.createMediaElementSource(narration);   // só pode ser criado uma vez por elemento
+    const speaker = ac.createGain();
+    const analyser = ac.createAnalyser();
+    analyser.fftSize = 1024;
+    const dest = ac.createMediaStreamDestination();
+    const norm = ac.createGain();
+    const duck = ac.createGain();
+    duck.gain.value = MUSIC_HIGH;
+    const endFade = ac.createGain();
+    src.connect(speaker);
+    speaker.connect(ac.destination);   // o que você ouve
+    src.connect(dest);                 // o que vai para o arquivo
+    src.connect(analyser);             // detector de fala e de áudio mudo
+    norm.connect(duck);
+    duck.connect(endFade);
+    endFade.connect(speaker);
+    endFade.connect(dest);
+    audioGraph = { ac, src, speaker, analyser, dest, duck, endFade, norm, rmsBuf: new Float32Array(1024) };
+    return audioGraph;
+  }
+
+  // Versão que nunca estoura erro: se não houver Web Audio, o app segue sem música.
+  function getGraph() {
+    if (audioGraph) return audioGraph;
+    if (audioFailed) return null;
+    try { return buildAudioGraph(); }
+    catch (err) { console.warn(err); audioFailed = true; return null; }
+  }
+
+  function warmAudio() {
+    const g = getGraph();
+    if (g && g.ac.state === 'suspended') g.ac.resume().catch(() => {});
+    prepareMusic();
+  }
+
+  const peakOf = (buf) => {
+    let pk = 0;
+    for (let c = 0; c < buf.numberOfChannels; c++) {
+      const d = buf.getChannelData(c);
+      for (let i = 0; i < d.length; i++) { const v = d[i] < 0 ? -d[i] : d[i]; if (v > pk) pk = v; }
+    }
+    return pk;
+  };
+
+  // ---- Batida Ambiente: tudo sintetizado com osciladores e filtros (OfflineAudioContext)
+  async function renderAmbient() {
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OAC) throw new Error('OfflineAudioContext indisponível');
+    const sr = 44100;
+    const beat = 60 / AMBIENT_BPM, bar = beat * 4, len = bar * AMBIENT_BARS;
+    const oc = new OAC(2, Math.ceil(len * sr), sr);
+    const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
+    const panned = (node, v) => {
+      if (!oc.createStereoPanner) return node;
+      const p = oc.createStereoPanner(); p.pan.value = v; node.connect(p); return p;
+    };
+
+    // saída: compressor leve + fades nas bordas (o loop emenda sem estalo)
+    const master = oc.createGain();
+    const comp = oc.createDynamicsCompressor();
+    comp.threshold.value = -18; comp.ratio.value = 3; comp.attack.value = 0.01; comp.release.value = 0.2;
+    master.connect(comp); comp.connect(oc.destination);
+    master.gain.setValueAtTime(0, 0);
+    master.gain.linearRampToValueAtTime(1, 0.02);
+    master.gain.setValueAtTime(1, len - 0.04);
+    master.gain.linearRampToValueAtTime(0, len);
+
+    // eco suave (dá "ar" aos plucks)
+    const echoIn = oc.createGain();
+    const echo = oc.createDelay(1.0);
+    echo.delayTime.value = beat * 0.75;
+    const fb = oc.createGain(); fb.gain.value = 0.32;
+    const echoTone = oc.createBiquadFilter(); echoTone.type = 'lowpass'; echoTone.frequency.value = 2200;
+    const echoOut = oc.createGain(); echoOut.gain.value = 0.55;
+    echoIn.connect(echo); echo.connect(echoTone); echoTone.connect(fb); fb.connect(echo);
+    echoTone.connect(echoOut); echoOut.connect(master);
+
+    // Lá menor - Fá - Dó - Sol (dois compassos cada)
+    const chords = [
+      { pad: [57, 60, 64], root: 45 },
+      { pad: [53, 57, 60], root: 41 },
+      { pad: [55, 60, 64], root: 48 },
+      { pad: [55, 59, 62], root: 43 }
+    ];
+    const barsPerChord = AMBIENT_BARS / chords.length;
+    const chordAt = (b) => chords[Math.floor(b / barsPerChord)];
+
+    // Pad: serras levemente desafinadas -> passa-baixas com LFO lento
+    chords.forEach((c, ci) => {
+      const t0 = ci * barsPerChord * bar, dur = barsPerChord * bar;
+      const lp = oc.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 650; lp.Q.value = 0.7;
+      const lfo = oc.createOscillator(); lfo.frequency.value = 0.18;
+      const lfoAmt = oc.createGain(); lfoAmt.gain.value = 220;
+      lfo.connect(lfoAmt); lfoAmt.connect(lp.frequency);
+      lfo.start(t0); lfo.stop(t0 + dur);
+      const env = oc.createGain();
+      env.gain.setValueAtTime(0, t0);
+      env.gain.linearRampToValueAtTime(0.11, t0 + 0.7);
+      env.gain.setValueAtTime(0.11, t0 + dur - 0.6);
+      env.gain.linearRampToValueAtTime(0, t0 + dur);
+      lp.connect(env);
+      panned(env, ci % 2 ? 0.2 : -0.2).connect(master);
+      c.pad.forEach((m) => [-7, 7].forEach((det) => {
+        const o = oc.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m); o.detune.value = det;
+        const g = oc.createGain(); g.gain.value = 0.3;
+        o.connect(g); g.connect(lp); o.start(t0); o.stop(t0 + dur + 0.05);
+      }));
+    });
+
+    for (let b = 0; b < AMBIENT_BARS; b++) {
+      const c = chordAt(b), t0 = b * bar;
+
+      // Baixo: senoide + harmônicos (aparece até em caixinha de celular)
+      [[0, 1.5], [2.5, 1.2]].forEach(([pos, lenBeats]) => {
+        const s = t0 + pos * beat, d = lenBeats * beat;
+        const g = oc.createGain();
+        g.gain.setValueAtTime(0, s);
+        g.gain.linearRampToValueAtTime(0.5, s + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.001, s + d);
+        g.connect(master);
+        [[1, 1], [2, 0.22], [3, 0.08]].forEach(([mult, amp]) => {
+          const o = oc.createOscillator(); o.type = 'sine'; o.frequency.value = mtof(c.root) * mult;
+          const og = oc.createGain(); og.gain.value = amp;
+          o.connect(og); og.connect(g); o.start(s); o.stop(s + d + 0.05);
+        });
+      });
+
+      // Bumbo: senoide com queda de afinação
+      [0, 2.5].forEach((pos) => {
+        const s = t0 + pos * beat;
+        const o = oc.createOscillator(); o.type = 'sine';
+        o.frequency.setValueAtTime(130, s);
+        o.frequency.exponentialRampToValueAtTime(46, s + 0.14);
+        const g = oc.createGain();
+        g.gain.setValueAtTime(0.0001, s);
+        g.gain.linearRampToValueAtTime(0.9, s + 0.005);
+        g.gain.exponentialRampToValueAtTime(0.001, s + 0.38);
+        o.connect(g); g.connect(master); o.start(s); o.stop(s + 0.4);
+      });
+
+      // Pluck arpejado: triângulo + passa-baixas que fecha + eco
+      const tones = [c.pad[0] + 12, c.pad[1] + 12, c.pad[2] + 12, c.pad[0] + 24];
+      const pat = b % 2 ? [0, null, 1, null, 2, 3, null, 2] : [0, null, 2, 1, null, 3, 2, null];
+      pat.forEach((p, i) => {
+        if (p === null) return;
+        const s = t0 + i * beat * 0.5;
+        const o = oc.createOscillator(); o.type = 'triangle'; o.frequency.value = mtof(tones[p]);
+        const lp = oc.createBiquadFilter(); lp.type = 'lowpass';
+        lp.frequency.setValueAtTime(3200, s); lp.frequency.exponentialRampToValueAtTime(700, s + 0.3);
+        const g = oc.createGain();
+        g.gain.setValueAtTime(0, s);
+        g.gain.linearRampToValueAtTime(0.1, s + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.001, s + 0.45);
+        o.connect(lp); lp.connect(g); g.connect(master); g.connect(echoIn);
+        o.start(s); o.stop(s + 0.5);
+      });
+    }
+
+    // Chimbal e palma: quadradas "metálicas" sempre ligadas, abertas por envelopes (barato de renderizar)
+    const metal = (freqs, bpFreq, bpQ, hpFreq) => {
+      const g = oc.createGain(); g.gain.value = 0;
+      const bp = oc.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = bpFreq; bp.Q.value = bpQ;
+      const hp = oc.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = hpFreq;
+      freqs.forEach((f) => {
+        const o = oc.createOscillator(); o.type = 'square'; o.frequency.value = f;
+        o.connect(bp); o.start(0); o.stop(len);
+      });
+      bp.connect(hp); hp.connect(g); g.connect(master);
+      return g;
+    };
+    const hat = metal([205.3, 304.4, 369.6, 522.7, 540, 800], 9500, 0.8, 7000);
+    const clap = metal([330, 440, 588, 790], 1800, 0.9, 900);
+    const hit = (g, s, peak, d) => {
+      g.gain.setValueAtTime(0, s);
+      g.gain.linearRampToValueAtTime(peak, s + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0005, s + d);
+      g.gain.setValueAtTime(0, s + d + 0.001);
+    };
+    for (let b = 0; b < AMBIENT_BARS; b++) {
+      for (let i = 0; i < 8; i++) hit(hat, b * bar + i * beat * 0.5, i % 2 ? 0.07 : 0.035, 0.05);
+      [1, 3].forEach((pos) => hit(clap, b * bar + pos * beat, 0.14, 0.12));
+    }
+
+    const buf = await new Promise((resolve, reject) => {
+      oc.oncomplete = (ev) => resolve(ev.renderedBuffer);
+      const pr = oc.startRendering();
+      if (pr && pr.then) pr.then(resolve, reject);
+    });
+    const pk = peakOf(buf);
+    if (pk > 0.0001) {                       // normaliza: o volume final depende só do ducking
+      const k = 0.85 / pk;
+      for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= k; }
+    }
+    return buf;
+  }
+
+  function musicBuffer() { return musicSel === 'custom' && customBuf ? customBuf : ambientBuf; }
+
+  function prepareMusic() {
+    if (musicSel === 'custom' && customBuf) return Promise.resolve(customBuf);
+    if (ambientBuf) return Promise.resolve(ambientBuf);
+    if (!ambientPromise) {
+      ambientPromise = renderAmbient()
+        .then((b) => { ambientBuf = b; return b; })
+        .catch((err) => { console.error(err); ambientPromise = null; return null; });
+    }
+    return ambientPromise;
+  }
+
+  // ---- Tocar / parar (com fades curtos para não estalar)
+  function musicStart(offset) {
+    musicStop(true);
+    const g = audioGraph;
+    const buf = musicBuffer();
+    if (!g || !buf) return;
+    const node = g.ac.createBufferSource();
+    node.buffer = buf;
+    node.loop = true;
+    const fade = g.ac.createGain();
+    const now = g.ac.currentTime;
+    fade.gain.setValueAtTime(0, now);
+    fade.gain.linearRampToValueAtTime(1, now + 0.12);
+    node.connect(fade);
+    fade.connect(g.norm);
+    g.norm.gain.value = buf === customBuf ? customNorm : 1;
+    const d = buf.duration || 1;
+    const off = ((offset % d) + d) % d;
+    try { node.start(0, off); } catch (err) { console.warn(err); return; }
+    musicNode = { node, fade };
+  }
+
+  function musicStop(quick) {
+    const m = musicNode;
+    musicNode = null;
+    if (!m || !audioGraph) return;
+    const now = audioGraph.ac.currentTime;
+    try {
+      m.fade.gain.cancelScheduledValues(now);
+      m.fade.gain.setValueAtTime(m.fade.gain.value, now);
+      m.fade.gain.linearRampToValueAtTime(0, now + (quick ? 0.03 : 0.15));
+      m.node.stop(now + (quick ? 0.06 : 0.2));
+    } catch {}
+  }
+
+  function resetMusicLevels() {
+    const g = audioGraph;
+    if (!g) return;
+    const now = g.ac.currentTime;
+    g.duck.gain.cancelScheduledValues(now);
+    g.duck.gain.setValueAtTime(MUSIC_HIGH, now);
+    g.endFade.gain.cancelScheduledValues(now);
+    g.endFade.gain.setValueAtTime(1, now);
+    duckTarget = MUSIC_HIGH; speakUntil = 0; lastEnd = 1;
+  }
+
+  function startMusicForPlayback() {
+    const g = getGraph();
+    if (!g) return;
+    if (g.ac.state === 'suspended') g.ac.resume().catch(() => {});
+    resetMusicLevels();
+    if (musicBuffer()) musicStart(t);
+    else prepareMusic().then((b) => { if (b && playing && !musicNode) musicStart(t); });
+  }
+
+  // ---- Volume inteligente (ducking): lê o nível REAL da narração, então acompanha as pausas de verdade
+  function musicTick() {
+    const g = audioGraph;
+    if (!g || !timeline) return;
+    const now = g.ac.currentTime;
+
+    let speaking = false;
+    if (timeline.audio && !narration.paused) {
+      g.analyser.getFloatTimeDomainData(g.rmsBuf);
+      let sum = 0;
+      for (let i = 0; i < g.rmsBuf.length; i++) sum += g.rmsBuf[i] * g.rmsBuf[i];
+      if (Math.sqrt(sum / g.rmsBuf.length) > SPEECH_RMS) speakUntil = now + 0.45;   // segura entre palavras
+      speaking = now < speakUntil;
+    }
+    const target = speaking ? MUSIC_LOW : MUSIC_HIGH;
+    if (target !== duckTarget) {
+      duckTarget = target;
+      g.duck.gain.cancelScheduledValues(now);
+      g.duck.gain.setValueAtTime(g.duck.gain.value, now);
+      g.duck.gain.setTargetAtTime(target, now, speaking ? 0.12 : 0.35);   // desce rápido, sobe suave
+    }
+
+    // sumir suavemente no último segundo do vídeo
+    const f = clamp((timeline.total - t) / 1.2, 0, 1);
+    if (f < 1 || lastEnd < 1) {
+      g.endFade.gain.setTargetAtTime(f, now, 0.03);
+      lastEnd = f;
+    }
+  }
+
+  // ---- Escolha da música (ambiente x MP3 próprio)
+  function selectMusic(sel) {
+    musicSel = sel === 'custom' && customBuf ? 'custom' : 'ambient';
+    document.querySelectorAll('input[name="musicSrc"]').forEach((r) => { r.checked = r.value === musicSel; });
+    if (audioGraph) audioGraph.norm.gain.value = musicSel === 'custom' ? customNorm : 1;
+    if (playing && audioGraph) prepareMusic().then(() => { if (playing) musicStart(t); });
+  }
+
+  document.querySelectorAll('input[name="musicSrc"]').forEach((r) => {
+    r.addEventListener('change', () => {
+      if (!r.checked) return;
+      if (r.value === 'custom' && !customBuf) {
+        selectMusic('ambient');           // volta ao padrão até o arquivo chegar
+        $('musicFile').click();
+        return;
+      }
+      selectMusic(r.value);
+    });
+  });
+
+  function decodeCompat(ac, ab) {
+    return new Promise((resolve, reject) => {
+      const p = ac.decodeAudioData(ab, resolve, reject);
+      if (p && p.catch) p.catch(reject);
+    });
+  }
+
+  $('musicFile').addEventListener('change', async () => {
+    const f = $('musicFile').files[0];
+    $('musicFile').value = '';
+    if (!f || exporting) return;
+    const label = $('musicFileName');
+    const restore = customBuf ? $('musicFileName').dataset.name : 'Nenhum arquivo escolhido';
+    if (f.size > CUSTOM_MAX_BYTES) { toast('Esse arquivo é grande demais (limite de 12 MB). Tente um MP3 mais leve 🙂'); return; }
+    const g = getGraph();
+    if (!g) { toast('Este navegador não suporta o áudio necessário para a música.'); return; }
+    if (g.ac.state === 'suspended') g.ac.resume().catch(() => {});
+    label.textContent = 'Carregando ' + f.name + '…';
+    try {
+      let buf = await decodeCompat(g.ac, await f.arrayBuffer());
+      if (!buf || buf.duration < 1) throw new Error('áudio muito curto');
+      if (buf.duration > CUSTOM_MAX_SECONDS) {         // guarda só o começo: economiza memória no celular
+        const n = Math.floor(CUSTOM_MAX_SECONDS * buf.sampleRate);
+        const cut = g.ac.createBuffer(buf.numberOfChannels, n, buf.sampleRate);
+        for (let c = 0; c < buf.numberOfChannels; c++) cut.copyToChannel(buf.getChannelData(c).subarray(0, n), c);
+        buf = cut;
+      }
+      const pk = peakOf(buf);
+      customNorm = pk > 0.0001 ? clamp(0.85 / pk, 0.25, 4) : 1;
+      customBuf = buf;
+      label.dataset.name = f.name + ' (' + fmt(buf.duration) + ')';
+      label.textContent = label.dataset.name;
+      selectMusic('custom');
+      toast('Música carregada ✓');
+    } catch (err) {
+      console.error(err);
+      label.textContent = restore || 'Nenhum arquivo escolhido';
+      toast('Não consegui ler esse áudio. Tente outro MP3 🙂');
+    }
+  });
+
+  /* =====================================================================
+     Player
+  ===================================================================== */
+  function pauseAllVideos() { clips.forEach((c) => { if (c.video) { try { c.video.pause(); } catch {} } }); }
+
+  function setPlaying(v) {
+    playing = v && !!timeline && clips.length > 0;
+    $('btnPlay').textContent = playing ? '❚❚' : '▶';
+    if (!playing) {
+      pauseAllVideos();
+      if (timeline && timeline.audio) narration.pause();
+      musicStop();
+    } else {
+      startMusicForPlayback();
+      if (timeline.audio) {
+        if (audioGraph && audioGraph.ac.state === 'suspended') audioGraph.ac.resume().catch(() => {});
+        const pr = narration.play();
+        if (pr && pr.catch) pr.catch(() => {
+          if (exporting) { exportFail(exErr('start')); return; }
+          playing = false;
+          $('btnPlay').textContent = '▶';
+          pauseAllVideos();
+          toast('Toque em ▶ para ouvir a narração');
+          dirty = true;
+        });
+      }
+      if (lastScene >= 0 && timeline.scenes[lastScene]) {
+        const sc = timeline.scenes[lastScene];
+        const cv = clips[sc.clipIndex % clips.length];
+        if (cv && cv.video) { const p = cv.video.play(); if (p && p.catch) p.catch(() => {}); }
+      }
+    }
+    dirty = true;
+  }
+  $('btnPlay').onclick = () => setPlaying(!playing);
+
+  $('seek').addEventListener('input', (e) => {
+    if (!timeline || exporting) return;
+    t = (parseInt(e.target.value, 10) / 1000) * timeline.total;
+    if (timeline.audio) { try { narration.currentTime = t; } catch {} }
+    if (playing) musicStart(t);
+    lastScene = -1;
+    dirty = true;
+  });
+
+  function sceneIndexAt(now) {
+    const sc = timeline.scenes;
+    for (let i = 0; i < sc.length; i++) if (now < sc[i].end) return i;
+    return sc.length - 1;
+  }
+
+  // Ativa a cena: troca o clipe. Se o clipe já foi pré-posicionado (prepareNext) ou é o mesmo
+  // da cena anterior, não precisa buscar de novo — evita quadros pretos nas trocas de cena.
+  function activateScene(scene, now, hard, si) {
+    const clip = clips[scene.clipIndex % clips.length];
+    const same = !hard && clip === lastClip;
+    const wasPrepared = !hard && prepared === si;
+    if (hard) prepared = -1;
+    clips.forEach((c) => { if (c !== clip && c.video) { try { c.video.pause(); } catch {} } });
+    if (clip.type !== 'image' && clip.video && !same && !wasPrepared) {
+      const dur = clip.duration || 0; let target = scene.srcStart + Math.max(0, now - scene.start);
+      if (dur > 0) target = target % dur;
+      try { clip.video.currentTime = target; } catch {}
+    }
+    lastClip = clip;
+    if (playing && clip.type !== 'image' && clip.video && clip.video.paused) { const p = clip.video.play(); if (p && p.catch) p.catch(() => {}); }
+  }
+  function prepareNext(si, now) {
+    if (!playing) return;
+    const next = timeline.scenes[si + 1]; if (!next || prepared === si + 1 || next.start - now > 0.7) return;
+    prepared = si + 1;
+    const cur = clips[timeline.scenes[si].clipIndex % clips.length];
+    const nc = clips[next.clipIndex % clips.length]; if (!nc || nc === cur || nc.type === 'imag
